@@ -21,7 +21,7 @@ use crate::bloom::RollingBloomFilter;
 use crate::bgp_client::BGPClient;
 
 pub const SECS_PER_SCAN_RESULTS: u64 = 15;
-const MAX_CONNS_PER_SEC_PER_STATUS: u64 = 1000;
+const MAX_CONNS_PER_SEC_PER_STATUS: u64 = 2500;
 
 #[derive(Clone, Copy, Hash, PartialEq, Eq)]
 pub enum AddressState {

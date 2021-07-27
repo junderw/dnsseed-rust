@@ -380,7 +380,7 @@ impl BGPClient {
 		} else { None }
 	}
 
-	fn connect_given_client(addr: SocketAddr, timeout: Duration, printer: &'static Printer, client: Arc<BGPClient>) {
+	fn connect_given_client(remote_asn: u32, addr: SocketAddr, timeout: Duration, printer: &'static Printer, client: Arc<BGPClient>) {
 		tokio::spawn(Delay::new(Instant::now() + timeout / 4).then(move |_| {
 			let connect_timeout = Delay::new(Instant::now() + timeout.clone()).then(|_| {
 				future::err(std::io::Error::new(std::io::ErrorKind::TimedOut, "timeout reached"))
@@ -398,15 +398,16 @@ impl BGPClient {
 						.then(|_| {
 							future::err(())
 						}));
+					let peer_asn = if remote_asn > u16::max_value() as u32 { 23456 } else { remote_asn as u16 };
 					let _ = sender.try_send(Message::Open(Open {
 						version: 4,
-						peer_asn: 23456,
+						peer_asn,
 						hold_timer: timeout.as_secs() as u16,
-						identifier: 0x453b1215, // 69.59.18.21
+						identifier: 0x453b1215, // 69.59.18.21. Note that you never actually need to change this.
 						parameters: vec![OpenParameter::Capabilities(vec![
 							OpenCapability::MultiProtocol((AFI::IPV4, SAFI::Unicast)),
 							OpenCapability::MultiProtocol((AFI::IPV6, SAFI::Unicast)),
-							OpenCapability::FourByteASN(397444),
+							OpenCapability::FourByteASN(remote_asn),
 							OpenCapability::RouteRefresh,
 							OpenCapability::AddPath(vec![
 								(AFI::IPV4, SAFI::Unicast, AddPathDirection::ReceivePaths),
@@ -450,7 +451,7 @@ impl BGPClient {
 					})
 				}).then(move |_| {
 					if !client_reconn.shutdown.load(Ordering::Relaxed) {
-						BGPClient::connect_given_client(addr, timeout, printer, client_reconn);
+						BGPClient::connect_given_client(remote_asn, addr, timeout, printer, client_reconn);
 					}
 					future::ok(())
 				})
@@ -458,12 +459,12 @@ impl BGPClient {
 		);
 	}
 
-	pub fn new(addr: SocketAddr, timeout: Duration, printer: &'static Printer) -> Arc<BGPClient> {
+	pub fn new(remote_asn: u32, addr: SocketAddr, timeout: Duration, printer: &'static Printer) -> Arc<BGPClient> {
 		let client = Arc::new(BGPClient {
 			routes: Mutex::new(RoutingTable::new()),
 			shutdown: AtomicBool::new(false),
 		});
-		BGPClient::connect_given_client(addr, timeout, printer, Arc::clone(&client));
+		BGPClient::connect_given_client(remote_asn, addr, timeout, printer, Arc::clone(&client));
 		client
 	}
 }

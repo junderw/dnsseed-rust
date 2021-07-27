@@ -469,8 +469,8 @@ fn make_trusted_conn(trusted_sockaddr: SocketAddr, bgp_client: Arc<BGPClient>) {
 }
 
 fn main() {
-	if env::args().len() != 5 {
-		println!("USAGE: dnsseed-rust datastore localPeerAddress tor_proxy_addr bgp_peer");
+	if env::args().len() != 6 {
+		println!("USAGE: dnsseed-rust datastore localPeerAddress tor_proxy_addr bgp_peer bgp_peer_asn");
 		return;
 	}
 
@@ -495,13 +495,14 @@ fn main() {
 		unsafe { TOR_PROXY = Some(tor_socks5_sockaddr); }
 
 		let bgp_sockaddr: SocketAddr = args.next().unwrap().parse().unwrap();
+		let bgp_peerasn: u32 = args.next().unwrap().parse().unwrap();
 
 		Store::new(path).and_then(move |store| {
 			unsafe { DATA_STORE = Some(Box::new(store)) };
 			let store = unsafe { DATA_STORE.as_ref().unwrap() };
 			unsafe { PRINTER = Some(Box::new(Printer::new(store))) };
 
-			let bgp_client = BGPClient::new(bgp_sockaddr, Duration::from_secs(60), unsafe { PRINTER.as_ref().unwrap() });
+			let bgp_client = BGPClient::new(bgp_peerasn, bgp_sockaddr, Duration::from_secs(60), unsafe { PRINTER.as_ref().unwrap() });
 			make_trusted_conn(trusted_sockaddr, Arc::clone(&bgp_client));
 
 			reader::read(store, unsafe { PRINTER.as_ref().unwrap() }, bgp_client);
