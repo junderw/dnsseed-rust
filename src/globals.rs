@@ -1,9 +1,13 @@
-use std::{ops::Deref, sync::{OnceLock, LazyLock}, net::SocketAddr};
 use crate::{datastore::Store, printer::Printer};
+use std::{
+    net::SocketAddr,
+    ops::Deref,
+    sync::{LazyLock, OnceLock},
+};
 
-use bitcoin::{Block, BlockHash, Network, blockdata::constants::genesis_block};
+use bitcoin::{blockdata::constants::genesis_block, Block, BlockHash, Network};
 use std::collections::HashMap;
-use std::sync::{Mutex, Arc};
+use std::sync::{Arc, Mutex};
 
 /// Wrapper that automatically dereferences OnceLock to its inner value
 #[derive(Copy, Clone)]
@@ -41,10 +45,11 @@ macro_rules! static_ref {
             use super::*;
             pub(super) static $name: OnceLock<$type> = OnceLock::new();
         }
-        
-        
+
         #[allow(non_upper_case_globals)]
-        pub const $name: StaticRef<&'static OnceLock<$type>> = StaticRef { inner: &$name::$name };
+        pub const $name: StaticRef<&'static OnceLock<$type>> = StaticRef {
+            inner: &$name::$name,
+        };
     };
     (LAZY, $name:ident, $type:ty, $init:expr) => {
         #[allow(non_snake_case)]
@@ -52,10 +57,11 @@ macro_rules! static_ref {
             use super::*;
             pub(super) static $name: LazyLock<$type> = LazyLock::new($init);
         }
-        
-        
+
         #[allow(non_upper_case_globals)]
-        pub const $name: StaticRef<&'static LazyLock<$type>> = StaticRef { inner: &$name::$name };
+        pub const $name: StaticRef<&'static LazyLock<$type>> = StaticRef {
+            inner: &$name::$name,
+        };
     };
 }
 static_ref!(ONCE, DATA_STORE, Store);
@@ -74,6 +80,15 @@ static_ref!(LAZY, HEIGHT_MAP, Mutex<HashMap<u64, BlockHash>>, || {
 static_ref!(LAZY, HIGHEST_HEADER, Mutex<(BlockHash, u64)>, || {
     Mutex::new((genesis_block(Network::Bitcoin).block_hash(), 0))
 });
-static_ref!(LAZY, REQUEST_BLOCK, Mutex<Arc<(u64, BlockHash, Block)>>, || {
-    Mutex::new(Arc::new((0, genesis_block(Network::Bitcoin).block_hash(), genesis_block(Network::Bitcoin))))
-});
+static_ref!(
+    LAZY,
+    REQUEST_BLOCK,
+    Mutex<Arc<(u64, BlockHash, Block)>>,
+    || {
+        Mutex::new(Arc::new((
+            0,
+            genesis_block(Network::Bitcoin).block_hash(),
+            genesis_block(Network::Bitcoin),
+        )))
+    }
+);

@@ -1,36 +1,39 @@
-use std::sync::{Arc, Mutex};
-use std::sync::atomic::{AtomicBool, Ordering};
 use std::cmp;
-use std::collections::{HashMap, hash_map};
+use std::collections::{hash_map, HashMap};
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
-use bgp_rs::{AFI, SAFI, AddPathDirection, Open, OpenCapability, OpenParameter, NLRIEncoding, PathAttribute};
 use bgp_rs::Capabilities;
-use bgp_rs::Segment;
 use bgp_rs::Message;
 use bgp_rs::Reader;
+use bgp_rs::Segment;
+use bgp_rs::{
+    AddPathDirection, NLRIEncoding, Open, OpenCapability, OpenParameter, PathAttribute, AFI, SAFI,
+};
 
 use bytes::Buf;
 use tokio::net::TcpStream;
-use tokio::time::sleep;
 use tokio::sync::mpsc;
+use tokio::time::sleep;
 use tokio_util::codec::{Decoder, Encoder, Framed};
 
 use futures::{SinkExt, StreamExt};
 
-use tracing::{debug, info, warn, error, trace};
+use tracing::{debug, error, info, trace, warn};
 
 use crate::printer::{Printer, Stat};
 use crate::timeout_stream::TimeoutStream;
 
 const PATH_SUFFIX_LEN: usize = 3;
 #[derive(Clone)]
-struct Route { // 32 bytes with a path id u32
-	path_suffix: [u32; PATH_SUFFIX_LEN],
-	path_len: u32,
-	pref: u32,
-	med: u32,
+struct Route {
+    // 32 bytes with a path id u32
+    path_suffix: [u32; PATH_SUFFIX_LEN],
+    path_len: u32,
+    pref: u32,
+    med: u32,
 }
 #[allow(dead_code)]
 const ROUTE_LEN: usize = 36 - std::mem::size_of::<(u32, Route)>();
@@ -41,16 +44,16 @@ const ROUTE_LEN: usize = 36 - std::mem::size_of::<(u32, Route)>();
 #[repr(packed)]
 #[derive(PartialEq, Eq, Hash)]
 struct V4Addr {
-	addr: [u8; 4],
-	pfxlen: u8,
+    addr: [u8; 4],
+    pfxlen: u8,
 }
 impl From<(Ipv4Addr, u8)> for V4Addr {
-	fn from(p: (Ipv4Addr, u8)) -> Self {
-		Self {
-			addr: p.0.octets(),
-			pfxlen: p.1,
-		}
-	}
+    fn from(p: (Ipv4Addr, u8)) -> Self {
+        Self {
+            addr: p.0.octets(),
+            pfxlen: p.1,
+        }
+    }
 }
 #[allow(dead_code)]
 const V4_ALIGN: usize = 1 - std::mem::align_of::<V4Addr>();
@@ -60,16 +63,16 @@ const V4_SIZE: usize = 5 - std::mem::size_of::<V4Addr>();
 #[repr(packed)]
 #[derive(PartialEq, Eq, Hash)]
 struct V6Addr {
-	addr: [u8; 16],
-	pfxlen: u8,
+    addr: [u8; 16],
+    pfxlen: u8,
 }
 impl From<(Ipv6Addr, u8)> for V6Addr {
-	fn from(p: (Ipv6Addr, u8)) -> Self {
-		Self {
-			addr: p.0.octets(),
-			pfxlen: p.1,
-		}
-	}
+    fn from(p: (Ipv6Addr, u8)) -> Self {
+        Self {
+            addr: p.0.octets(),
+            pfxlen: p.1,
+        }
+    }
 }
 #[allow(dead_code)]
 const V6_ALIGN: usize = 1 - std::mem::align_of::<V6Addr>();
@@ -77,499 +80,556 @@ const V6_ALIGN: usize = 1 - std::mem::align_of::<V6Addr>();
 const V6_SIZE: usize = 17 - std::mem::size_of::<V6Addr>();
 
 struct RoutingTable {
-	// We really want a HashMap for the values here, but they'll only ever contain a few entries,
-	// and Vecs are way more memory-effecient in that case.
-	v4_table: HashMap<V4Addr, Vec<(u32, Route)>>,
-	v6_table: HashMap<V6Addr, Vec<(u32, Route)>>,
-	max_paths: usize,
-	routes_with_max: usize,
+    // We really want a HashMap for the values here, but they'll only ever contain a few entries,
+    // and Vecs are way more memory-effecient in that case.
+    v4_table: HashMap<V4Addr, Vec<(u32, Route)>>,
+    v6_table: HashMap<V6Addr, Vec<(u32, Route)>>,
+    max_paths: usize,
+    routes_with_max: usize,
 }
 
 impl RoutingTable {
-	fn new() -> Self {
-		Self {
-			v4_table: HashMap::with_capacity(900_000),
-			v6_table: HashMap::with_capacity(100_000),
-			max_paths: 0,
-			routes_with_max: 0,
-		}
-	}
+    fn new() -> Self {
+        Self {
+            v4_table: HashMap::with_capacity(900_000),
+            v6_table: HashMap::with_capacity(100_000),
+            max_paths: 0,
+            routes_with_max: 0,
+        }
+    }
 
-	fn get_route_attrs(&self, ip: IpAddr) -> (u8, Vec<&Route>) {
-		macro_rules! lookup_res {
-			($addrty: ty, $addr: expr, $table: expr, $addr_bits: expr) => { {
-				//TODO: Optimize this (probably means making the tables btrees)!
-				let mut lookup = <$addrty>::from(($addr, $addr_bits));
-				for i in 0..$addr_bits {
-					if let Some(routes) = $table.get(&lookup) {
-						if routes.len() > 0 {
-							return (lookup.pfxlen, routes.iter().map(|v| &v.1).collect());
-						}
-					}
-					lookup.addr[lookup.addr.len() - (i/8) - 1] &= !(1u8 << (i % 8));
-					lookup.pfxlen -= 1;
-				}
-				(0, vec![])
-			} }
-		}
-		match ip {
-			IpAddr::V4(v4a) => lookup_res!(V4Addr, v4a, self.v4_table, 32),
-			IpAddr::V6(v6a) => lookup_res!(V6Addr, v6a, self.v6_table, 128)
-		}
-	}
+    fn get_route_attrs(&self, ip: IpAddr) -> (u8, Vec<&Route>) {
+        macro_rules! lookup_res {
+            ($addrty: ty, $addr: expr, $table: expr, $addr_bits: expr) => {{
+                //TODO: Optimize this (probably means making the tables btrees)!
+                let mut lookup = <$addrty>::from(($addr, $addr_bits));
+                for i in 0..$addr_bits {
+                    if let Some(routes) = $table.get(&lookup) {
+                        if routes.len() > 0 {
+                            return (lookup.pfxlen, routes.iter().map(|v| &v.1).collect());
+                        }
+                    }
+                    lookup.addr[lookup.addr.len() - (i / 8) - 1] &= !(1u8 << (i % 8));
+                    lookup.pfxlen -= 1;
+                }
+                (0, vec![])
+            }};
+        }
+        match ip {
+            IpAddr::V4(v4a) => lookup_res!(V4Addr, v4a, self.v4_table, 32),
+            IpAddr::V6(v6a) => lookup_res!(V6Addr, v6a, self.v6_table, 128),
+        }
+    }
 
-	fn withdraw(&mut self, route: NLRIEncoding) {
-		macro_rules! remove {
-			($rt: expr, $v: expr, $id: expr) => { {
-				match $rt.entry($v.into()) {
-					hash_map::Entry::Occupied(mut entry) => {
-						if entry.get().len() == self.max_paths {
-							self.routes_with_max -= 1;
-							if self.routes_with_max == 0 {
-								self.max_paths = 0;
-							}
-						}
-						entry.get_mut().retain(|e| e.0 != $id);
-						if entry.get_mut().is_empty() {
-							entry.remove();
-						}
-					},
-					_ => {},
-				}
-			} }
-		}
-		match route {
-			NLRIEncoding::IP(p) => {
-				let (ip, len) = <(IpAddr, u8)>::from(&p);
-				match ip {
-					IpAddr::V4(v4a) => remove!(self.v4_table, (v4a, len), 0),
-					IpAddr::V6(v6a) => remove!(self.v6_table, (v6a, len), 0),
-				}
-			},
-			NLRIEncoding::IP_WITH_PATH_ID((p, id)) => {
-				let (ip, len) = <(IpAddr, u8)>::from(&p);
-				match ip {
-					IpAddr::V4(v4a) => remove!(self.v4_table, (v4a, len), id),
-					IpAddr::V6(v6a) => remove!(self.v6_table, (v6a, len), id),
-				}
-			},
-			NLRIEncoding::IP_MPLS(_) => (),
-			NLRIEncoding::IP_MPLS_WITH_PATH_ID(_) => (),
-			NLRIEncoding::IP_VPN_MPLS(_) => (),
-			NLRIEncoding::L2VPN(_) => (),
-		};
-	}
+    fn withdraw(&mut self, route: NLRIEncoding) {
+        macro_rules! remove {
+            ($rt: expr, $v: expr, $id: expr) => {{
+                match $rt.entry($v.into()) {
+                    hash_map::Entry::Occupied(mut entry) => {
+                        if entry.get().len() == self.max_paths {
+                            self.routes_with_max -= 1;
+                            if self.routes_with_max == 0 {
+                                self.max_paths = 0;
+                            }
+                        }
+                        entry.get_mut().retain(|e| e.0 != $id);
+                        if entry.get_mut().is_empty() {
+                            entry.remove();
+                        }
+                    }
+                    _ => {}
+                }
+            }};
+        }
+        match route {
+            NLRIEncoding::IP(p) => {
+                let (ip, len) = <(IpAddr, u8)>::from(&p);
+                match ip {
+                    IpAddr::V4(v4a) => remove!(self.v4_table, (v4a, len), 0),
+                    IpAddr::V6(v6a) => remove!(self.v6_table, (v6a, len), 0),
+                }
+            }
+            NLRIEncoding::IP_WITH_PATH_ID((p, id)) => {
+                let (ip, len) = <(IpAddr, u8)>::from(&p);
+                match ip {
+                    IpAddr::V4(v4a) => remove!(self.v4_table, (v4a, len), id),
+                    IpAddr::V6(v6a) => remove!(self.v6_table, (v6a, len), id),
+                }
+            }
+            NLRIEncoding::IP_MPLS(_) => (),
+            NLRIEncoding::IP_MPLS_WITH_PATH_ID(_) => (),
+            NLRIEncoding::IP_VPN_MPLS(_) => (),
+            NLRIEncoding::L2VPN(_) => (),
+        };
+    }
 
-	fn announce(&mut self, prefix: NLRIEncoding, route: Route) {
-		macro_rules! insert {
-			($rt: expr, $v: expr, $id: expr) => { {
-				let old_max_paths = self.max_paths;
-				let entry = $rt.entry($v.into()).or_insert_with(|| Vec::with_capacity(old_max_paths));
-				let entry_had_max = entry.len() == self.max_paths;
-				entry.retain(|e| e.0 != $id);
-				if entry_had_max {
-					entry.reserve_exact(1);
-				} else {
-					entry.reserve_exact(cmp::max(self.max_paths, entry.len() + 1) - entry.len());
-				}
-				entry.push(($id, route));
-				if entry.len() > self.max_paths {
-					self.max_paths = entry.len();
-					self.routes_with_max = 1;
-				} else if entry.len() == self.max_paths {
-					if !entry_had_max { self.routes_with_max += 1; }
-				}
-			} }
-		}
-		match prefix {
-			NLRIEncoding::IP(p) => {
-				let (ip, len) = <(IpAddr, u8)>::from(&p);
-				match ip {
-					IpAddr::V4(v4a) => insert!(self.v4_table, (v4a, len), 0),
-					IpAddr::V6(v6a) => insert!(self.v6_table, (v6a, len), 0),
-				}
-			},
-			NLRIEncoding::IP_WITH_PATH_ID((p, id)) => {
-				let (ip, len) = <(IpAddr, u8)>::from(&p);
-				match ip {
-					IpAddr::V4(v4a) => insert!(self.v4_table, (v4a, len), id),
-					IpAddr::V6(v6a) => insert!(self.v6_table, (v6a, len), id),
-				}
-			},
-			NLRIEncoding::IP_MPLS(_) => (),
-			NLRIEncoding::IP_MPLS_WITH_PATH_ID(_) => (),
-			NLRIEncoding::IP_VPN_MPLS(_) => (),
-			NLRIEncoding::L2VPN(_) => (),
-		};
-	}
+    fn announce(&mut self, prefix: NLRIEncoding, route: Route) {
+        macro_rules! insert {
+            ($rt: expr, $v: expr, $id: expr) => {{
+                let old_max_paths = self.max_paths;
+                let entry = $rt
+                    .entry($v.into())
+                    .or_insert_with(|| Vec::with_capacity(old_max_paths));
+                let entry_had_max = entry.len() == self.max_paths;
+                entry.retain(|e| e.0 != $id);
+                if entry_had_max {
+                    entry.reserve_exact(1);
+                } else {
+                    entry.reserve_exact(cmp::max(self.max_paths, entry.len() + 1) - entry.len());
+                }
+                entry.push(($id, route));
+                if entry.len() > self.max_paths {
+                    self.max_paths = entry.len();
+                    self.routes_with_max = 1;
+                } else if entry.len() == self.max_paths {
+                    if !entry_had_max {
+                        self.routes_with_max += 1;
+                    }
+                }
+            }};
+        }
+        match prefix {
+            NLRIEncoding::IP(p) => {
+                let (ip, len) = <(IpAddr, u8)>::from(&p);
+                match ip {
+                    IpAddr::V4(v4a) => insert!(self.v4_table, (v4a, len), 0),
+                    IpAddr::V6(v6a) => insert!(self.v6_table, (v6a, len), 0),
+                }
+            }
+            NLRIEncoding::IP_WITH_PATH_ID((p, id)) => {
+                let (ip, len) = <(IpAddr, u8)>::from(&p);
+                match ip {
+                    IpAddr::V4(v4a) => insert!(self.v4_table, (v4a, len), id),
+                    IpAddr::V6(v6a) => insert!(self.v6_table, (v6a, len), id),
+                }
+            }
+            NLRIEncoding::IP_MPLS(_) => (),
+            NLRIEncoding::IP_MPLS_WITH_PATH_ID(_) => (),
+            NLRIEncoding::IP_VPN_MPLS(_) => (),
+            NLRIEncoding::L2VPN(_) => (),
+        };
+    }
 }
 
 struct BytesCoder<'a>(&'a mut bytes::BytesMut);
 impl<'a> std::io::Write for BytesCoder<'a> {
-	fn write(&mut self, b: &[u8]) -> Result<usize, std::io::Error> {
-		self.0.extend_from_slice(&b);
-		Ok(b.len())
-	}
-	fn flush(&mut self) -> Result<(), std::io::Error> {
-		Ok(())
-	}
+    fn write(&mut self, b: &[u8]) -> Result<usize, std::io::Error> {
+        self.0.extend_from_slice(&b);
+        Ok(b.len())
+    }
+    fn flush(&mut self) -> Result<(), std::io::Error> {
+        Ok(())
+    }
 }
 struct BytesDecoder<'a> {
-	buf: &'a mut bytes::BytesMut,
-	pos: usize,
+    buf: &'a mut bytes::BytesMut,
+    pos: usize,
 }
 impl<'a> std::io::Read for BytesDecoder<'a> {
-	fn read(&mut self, b: &mut [u8]) -> Result<usize, std::io::Error> {
-		let copy_len = cmp::min(b.len(), self.buf.len() - self.pos);
-		b[..copy_len].copy_from_slice(&self.buf[self.pos..self.pos + copy_len]);
-		self.pos += copy_len;
-		Ok(copy_len)
-	}
+    fn read(&mut self, b: &mut [u8]) -> Result<usize, std::io::Error> {
+        let copy_len = cmp::min(b.len(), self.buf.len() - self.pos);
+        b[..copy_len].copy_from_slice(&self.buf[self.pos..self.pos + copy_len]);
+        self.pos += copy_len;
+        Ok(copy_len)
+    }
 }
 
 struct MsgCoder(Option<Capabilities>);
 impl Decoder for MsgCoder {
-	type Item = Message;
-	type Error = std::io::Error;
+    type Item = Message;
+    type Error = std::io::Error;
 
-	fn decode(&mut self, bytes: &mut bytes::BytesMut) -> Result<Option<Message>, std::io::Error> {
-		let mut decoder = BytesDecoder {
-			buf: bytes,
-			pos: 0
-		};
-		let def_cap = Default::default();
-		let mut reader = Reader {
-			stream: &mut decoder,
-			capabilities: if let Some(cap) = &self.0 { cap } else { &def_cap },
-		};
-		match reader.read() {
-			Ok((_header, msg)) => {
-				decoder.buf.advance(decoder.pos);
-				trace!(msg_type = ?std::mem::discriminant(&msg), "Decoded BGP message");
-				if let Message::Open(ref o) = &msg {
-					debug!(
-						version = o.version,
-						peer_asn = o.peer_asn,
-						hold_timer = o.hold_timer,
-						identifier = format_args!("0x{:08x}", o.identifier),
-						params_count = o.parameters.len(),
-						"Received BGP OPEN message"
-					);
-					self.0 = Some(Capabilities::from_parameters(o.parameters.clone()));
-				}
-				Ok(Some(msg))
-			},
-			Err(e) => match e.kind() {
-				std::io::ErrorKind::UnexpectedEof => Ok(None),
-				_ => {
-					error!(error = %e, "BGP message decode error");
-					Err(e)
-				},
-			},
-		}
-	}
+    fn decode(&mut self, bytes: &mut bytes::BytesMut) -> Result<Option<Message>, std::io::Error> {
+        let mut decoder = BytesDecoder { buf: bytes, pos: 0 };
+        let def_cap = Default::default();
+        let mut reader = Reader {
+            stream: &mut decoder,
+            capabilities: if let Some(cap) = &self.0 {
+                cap
+            } else {
+                &def_cap
+            },
+        };
+        match reader.read() {
+            Ok((_header, msg)) => {
+                decoder.buf.advance(decoder.pos);
+                trace!(msg_type = ?std::mem::discriminant(&msg), "Decoded BGP message");
+                if let Message::Open(ref o) = &msg {
+                    debug!(
+                        version = o.version,
+                        peer_asn = o.peer_asn,
+                        hold_timer = o.hold_timer,
+                        identifier = format_args!("0x{:08x}", o.identifier),
+                        params_count = o.parameters.len(),
+                        "Received BGP OPEN message"
+                    );
+                    self.0 = Some(Capabilities::from_parameters(o.parameters.clone()));
+                }
+                Ok(Some(msg))
+            }
+            Err(e) => match e.kind() {
+                std::io::ErrorKind::UnexpectedEof => Ok(None),
+                _ => {
+                    error!(error = %e, "BGP message decode error");
+                    Err(e)
+                }
+            },
+        }
+    }
 }
 impl Encoder<Message> for MsgCoder {
-	type Error = std::io::Error;
+    type Error = std::io::Error;
 
-	fn encode(&mut self, msg: Message, res: &mut bytes::BytesMut) -> Result<(), std::io::Error> {
-		trace!(msg_type = ?std::mem::discriminant(&msg), "Encoding BGP message");
-		msg.encode(&mut BytesCoder(res))?;
-		Ok(())
-	}
+    fn encode(&mut self, msg: Message, res: &mut bytes::BytesMut) -> Result<(), std::io::Error> {
+        trace!(msg_type = ?std::mem::discriminant(&msg), "Encoding BGP message");
+        msg.encode(&mut BytesCoder(res))?;
+        Ok(())
+    }
 }
 
 pub struct BGPClient {
-	routes: Mutex<RoutingTable>,
-	shutdown: AtomicBool,
+    routes: Mutex<RoutingTable>,
+    shutdown: AtomicBool,
 }
 impl BGPClient {
-	pub fn get_asn(&self, addr: IpAddr) -> u32 {
-		let lock = self.routes.lock().unwrap();
-		let mut path_vecs = lock.get_route_attrs(addr).1;
-		if path_vecs.is_empty() { return 0; }
+    pub fn get_asn(&self, addr: IpAddr) -> u32 {
+        let lock = self.routes.lock().unwrap();
+        let mut path_vecs = lock.get_route_attrs(addr).1;
+        if path_vecs.is_empty() {
+            return 0;
+        }
 
-		path_vecs.sort_unstable_by(|path_a, path_b| {
-			path_a.pref.cmp(&path_b.pref)
-				.then(path_b.path_len.cmp(&path_a.path_len))
-				.then(path_b.med.cmp(&path_a.med))
-		});
+        path_vecs.sort_unstable_by(|path_a, path_b| {
+            path_a
+                .pref
+                .cmp(&path_b.pref)
+                .then(path_b.path_len.cmp(&path_a.path_len))
+                .then(path_b.med.cmp(&path_a.med))
+        });
 
-		let primary_route = path_vecs.pop().unwrap();
-		if path_vecs.len() > 3 {
-			// If we have at least 3 paths, try to find the last unique ASN which doesn't show up in other paths
-			// If we hit a T1 that is reasonably assumed to care about net neutrality, return the
-			// previous ASN.
-			let mut prev_asn = 0;
-			'asn_candidates: for asn in primary_route.path_suffix.iter().rev() {
-				if *asn == 0 { continue 'asn_candidates; }
-				match *asn {
-					// Included: CenturyLink (L3), Cogent, Telia, NTT, GTT, Level3,
-					//           GBLX (L3), Zayo, TI Sparkle Seabone, HE, Telefonica
-					// Left out from Caida top-20: TATA, PCCW, Vodafone, RETN, Orange, Telstra,
-					//                             Singtel, Rostelecom, DTAG
-					209|174|1299|2914|3257|3356|3549|6461|6762|6939|12956 if prev_asn != 0 => return prev_asn,
-					_ => if path_vecs.iter().any(|route| !route.path_suffix.contains(asn)) {
-						if prev_asn != 0 { return prev_asn } else {
-							// Multi-origin prefix, just give up and take the last AS in the
-							// default path
-							break 'asn_candidates;
-						}
-					} else {
-						// We only ever possibly return an ASN if it appears in all paths
-						prev_asn = *asn;
-					},
-				}
-			}
-			// All paths were the same, if the first ASN is non-0, return it.
-			if prev_asn != 0 {
-				return prev_asn;
-			}
-		}
+        let primary_route = path_vecs.pop().unwrap();
+        if path_vecs.len() > 3 {
+            // If we have at least 3 paths, try to find the last unique ASN which doesn't show up in other paths
+            // If we hit a T1 that is reasonably assumed to care about net neutrality, return the
+            // previous ASN.
+            let mut prev_asn = 0;
+            'asn_candidates: for asn in primary_route.path_suffix.iter().rev() {
+                if *asn == 0 {
+                    continue 'asn_candidates;
+                }
+                match *asn {
+                    // Included: CenturyLink (L3), Cogent, Telia, NTT, GTT, Level3,
+                    //           GBLX (L3), Zayo, TI Sparkle Seabone, HE, Telefonica
+                    // Left out from Caida top-20: TATA, PCCW, Vodafone, RETN, Orange, Telstra,
+                    //                             Singtel, Rostelecom, DTAG
+                    209 | 174 | 1299 | 2914 | 3257 | 3356 | 3549 | 6461 | 6762 | 6939 | 12956
+                        if prev_asn != 0 =>
+                    {
+                        return prev_asn
+                    }
+                    _ => {
+                        if path_vecs
+                            .iter()
+                            .any(|route| !route.path_suffix.contains(asn))
+                        {
+                            if prev_asn != 0 {
+                                return prev_asn;
+                            } else {
+                                // Multi-origin prefix, just give up and take the last AS in the
+                                // default path
+                                break 'asn_candidates;
+                            }
+                        } else {
+                            // We only ever possibly return an ASN if it appears in all paths
+                            prev_asn = *asn;
+                        }
+                    }
+                }
+            }
+            // All paths were the same, if the first ASN is non-0, return it.
+            if prev_asn != 0 {
+                return prev_asn;
+            }
+        }
 
-		for asn in primary_route.path_suffix.iter().rev() {
-			if *asn != 0 {
-				return *asn;
-			}
-		}
-		0
-	}
+        for asn in primary_route.path_suffix.iter().rev() {
+            if *asn != 0 {
+                return *asn;
+            }
+        }
+        0
+    }
 
-	pub fn get_path(&self, addr: IpAddr) -> (u8, [u32; PATH_SUFFIX_LEN]) {
-		let lock = self.routes.lock().unwrap();
-		let (prefixlen, mut path_vecs) = lock.get_route_attrs(addr);
-		if path_vecs.is_empty() { return (0, [0; PATH_SUFFIX_LEN]); }
+    pub fn get_path(&self, addr: IpAddr) -> (u8, [u32; PATH_SUFFIX_LEN]) {
+        let lock = self.routes.lock().unwrap();
+        let (prefixlen, mut path_vecs) = lock.get_route_attrs(addr);
+        if path_vecs.is_empty() {
+            return (0, [0; PATH_SUFFIX_LEN]);
+        }
 
-		path_vecs.sort_unstable_by(|path_a, path_b| {
-			path_a.pref.cmp(&path_b.pref)
-				.then(path_b.path_len.cmp(&path_a.path_len))
-				.then(path_b.med.cmp(&path_a.med))
-		});
+        path_vecs.sort_unstable_by(|path_a, path_b| {
+            path_a
+                .pref
+                .cmp(&path_b.pref)
+                .then(path_b.path_len.cmp(&path_a.path_len))
+                .then(path_b.med.cmp(&path_a.med))
+        });
 
-		let primary_route = path_vecs.pop().unwrap();
-		(prefixlen, primary_route.path_suffix)
-	}
+        let primary_route = path_vecs.pop().unwrap();
+        (prefixlen, primary_route.path_suffix)
+    }
 
-	pub fn disconnect(&self) {
-		self.shutdown.store(true, Ordering::Relaxed);
-	}
+    pub fn disconnect(&self) {
+        self.shutdown.store(true, Ordering::Relaxed);
+    }
 
-	fn map_attrs(mut attrs: Vec<PathAttribute>) -> Option<Route> {
-		let mut as4_path = None;
-		let mut as_path = None;
-		let mut pref = 100;
-		let mut med = 0;
-		for attr in attrs.drain(..) {
-			match attr {
-				PathAttribute::AS4_PATH(path) => as4_path = Some(path),
-				PathAttribute::AS_PATH(path) => as_path = Some(path),
-				PathAttribute::LOCAL_PREF(p) => pref = p,
-				PathAttribute::MULTI_EXIT_DISC(m) => med = m,
-				_ => {},
-			}
-		}
-		if let Some(mut aspath) = as4_path.or(as_path) {
-			let mut pathvec = Vec::new();
-			for seg in aspath.segments.drain(..) {
-				match seg {
-					Segment::AS_SEQUENCE(mut asn) => pathvec.append(&mut asn),
-					Segment::AS_SET(_) => {}, // Ignore sets for now, they're not that common anyway
-				}
-			}
-			let path_len = pathvec.len() as u32;
-			pathvec.dedup_by(|a, b| (*a).eq(b)); // Drop prepends, cause we don't care in this case
+    fn map_attrs(mut attrs: Vec<PathAttribute>) -> Option<Route> {
+        let mut as4_path = None;
+        let mut as_path = None;
+        let mut pref = 100;
+        let mut med = 0;
+        for attr in attrs.drain(..) {
+            match attr {
+                PathAttribute::AS4_PATH(path) => as4_path = Some(path),
+                PathAttribute::AS_PATH(path) => as_path = Some(path),
+                PathAttribute::LOCAL_PREF(p) => pref = p,
+                PathAttribute::MULTI_EXIT_DISC(m) => med = m,
+                _ => {}
+            }
+        }
+        if let Some(mut aspath) = as4_path.or(as_path) {
+            let mut pathvec = Vec::new();
+            for seg in aspath.segments.drain(..) {
+                match seg {
+                    Segment::AS_SEQUENCE(mut asn) => pathvec.append(&mut asn),
+                    Segment::AS_SET(_) => {} // Ignore sets for now, they're not that common anyway
+                }
+            }
+            let path_len = pathvec.len() as u32;
+            pathvec.dedup_by(|a, b| (*a).eq(b)); // Drop prepends, cause we don't care in this case
 
-			let mut path_suffix = [0; PATH_SUFFIX_LEN];
-			for (idx, asn) in pathvec.iter().rev().enumerate() {
-				path_suffix[PATH_SUFFIX_LEN - idx - 1] = *asn;
-				if idx == PATH_SUFFIX_LEN - 1 { break; }
-			}
+            let mut path_suffix = [0; PATH_SUFFIX_LEN];
+            for (idx, asn) in pathvec.iter().rev().enumerate() {
+                path_suffix[PATH_SUFFIX_LEN - idx - 1] = *asn;
+                if idx == PATH_SUFFIX_LEN - 1 {
+                    break;
+                }
+            }
 
-			return Some(Route {
-				path_suffix,
-				path_len,
-				pref,
-				med,
-			})
-		} else { None }
-	}
+            return Some(Route {
+                path_suffix,
+                path_len,
+                pref,
+                med,
+            });
+        } else {
+            None
+        }
+    }
 
-	fn connect_given_client(remote_asn: u32, addr: SocketAddr, timeout: Duration, printer: &'static Printer, client: Arc<BGPClient>, identifier: u32) {
-		info!(
-			peer = %addr,
-			remote_asn = remote_asn,
-			identifier = format_args!("0x{:08x}", identifier),
-			timeout_secs = timeout.as_secs(),
-			"Initiating BGP connection"
-		);
-		tokio::spawn(async move {
-			// Initial delay before connecting
-			sleep(timeout / 4).await;
-			debug!(peer = %addr, "Connection delay elapsed, attempting TCP connect");
-			
-			loop {
-				// Try to connect with timeout
-				let stream = match tokio::time::timeout(timeout, TcpStream::connect(addr)).await {
-					Ok(Ok(stream)) => stream,
-					Ok(Err(e)) => {
-						warn!(peer = %addr, error = ?e, "BGP TCP connection failed, will retry");
-						sleep(timeout / 2).await;
-						if client.shutdown.load(Ordering::Relaxed) {
-							info!(peer = %addr, "BGP shutdown requested, not reconnecting");
-							return;
-						}
-						continue;
-					},
-					Err(_) => {
-						warn!("BGP connection timeout reached");
-						sleep(timeout / 2).await;
-						if client.shutdown.load(Ordering::Relaxed) {
-							info!(peer = %addr, "BGP shutdown requested, not reconnecting");
-							return;
-						}
-						continue;
-					}
-				};
-				
-				info!(peer = %addr, "BGP TCP connection established");
-				let (mut write, read) = Framed::new(stream, MsgCoder(None)).split();
-				let (sender, mut receiver) = mpsc::channel::<Message>(10);
-				
-				// Spawn write task
-				tokio::spawn(async move {
-					while let Some(msg) = receiver.recv().await {
-						if write.send(msg).await.is_err() {
-							error!("BGP write stream error");
-							break;
-						}
-					}
-					debug!("BGP write stream closed");
-				});
-				
-				let peer_asn = if remote_asn > u16::max_value() as u32 { 23456 } else { remote_asn as u16 };
-				debug!(
-					peer = %addr,
-					version = 4,
-					peer_asn = peer_asn,
-					actual_asn = remote_asn,
-					hold_timer = timeout.as_secs(),
-					identifier = format_args!("0x{:08x}", identifier),
-					"Sending BGP OPEN message"
-				);
-				let _ = sender.send(Message::Open(Open {
-					version: 4,
-					peer_asn,
-					hold_timer: timeout.as_secs() as u16,
-					identifier,
-					parameters: vec![OpenParameter::Capabilities(vec![
-						OpenCapability::MultiProtocol((AFI::IPV4, SAFI::Unicast)),
-						OpenCapability::MultiProtocol((AFI::IPV6, SAFI::Unicast)),
-						OpenCapability::FourByteASN(remote_asn),
-						OpenCapability::RouteRefresh,
-						OpenCapability::AddPath(vec![
-							(AFI::IPV4, SAFI::Unicast, AddPathDirection::ReceivePaths),
-							(AFI::IPV6, SAFI::Unicast, AddPathDirection::ReceivePaths)]),
-					])],
-				})).await;
-				
-				// Process messages with timeout
-				let timed_read = TimeoutStream::new_persistent(read, timeout);
-				let mut timed_read = std::pin::pin!(timed_read);
-				while let Some(result) = timed_read.next().await {
-					if client.shutdown.load(Ordering::Relaxed) {
-						info!(peer = %addr, "BGP client shutdown requested");
-						return;
-					}
-					
-					let bgp_msg = match result {
-						Ok(msg) => msg,
-						Err(e) => {
-							error!(peer = %addr, error = ?e, "BGP stream error");
-							printer.add_line(format!("Got error from BGP stream: {:?}", e), true);
-							break;
-						}
-					};
-					
-					match bgp_msg {
-						Message::Open(ref open) => {
-							info!(
-								peer = %addr,
-								remote_identifier = format_args!("0x{:08x}", open.identifier),
-								remote_hold_timer = open.hold_timer,
-								remote_version = open.version,
-								"Received BGP OPEN, session established"
-							);
-							client.routes.lock().unwrap().v4_table.clear();
-							client.routes.lock().unwrap().v6_table.clear();
-							printer.add_line("Connected to BGP route provider".to_string(), false);
-						},
-						Message::KeepAlive => {
-							trace!(peer = %addr, "Received BGP KEEPALIVE, sending response");
-							let _ = sender.send(Message::KeepAlive).await;
-						},
-						Message::Update(mut upd) => {
-							trace!(
-								peer = %addr,
-								withdrawn_count = upd.withdrawn_routes.len(),
-								announced_count = upd.announced_routes.len(),
-								attrs_count = upd.attributes.len(),
-								"Received BGP UPDATE"
-							);
-							let _ = sender.send(Message::KeepAlive).await;
-							upd.normalize();
-							let mut route_table = client.routes.lock().unwrap();
-							for r in upd.withdrawn_routes {
-								trace!(route = ?r, "Withdrawing route");
-								route_table.withdraw(r);
-							}
-							if let Some(path) = Self::map_attrs(upd.attributes) {
-								for r in upd.announced_routes {
-									trace!(route = ?r, path_len = path.path_len, "Announcing route");
-									route_table.announce(r, path.clone());
-								}
-							}
-							printer.set_stat(Stat::V4RoutingTableSize(route_table.v4_table.len()));
-							printer.set_stat(Stat::V6RoutingTableSize(route_table.v6_table.len()));
-							printer.set_stat(Stat::RoutingTablePaths(route_table.max_paths));
-						},
-						Message::Notification(notif) => {
-							error!(
-								peer = %addr,
-								error_code = notif.major_err_code,
-								error_subcode = notif.minor_err_code,
-								data = ?notif.data,
-								"Received BGP NOTIFICATION"
-							);
-						},
-						msg => {
-							debug!(peer = %addr, msg_type = ?std::mem::discriminant(&msg), "Received other BGP message");
-						}
-					}
-				}
-				
-				// Connection closed, check if we should reconnect
-				if client.shutdown.load(Ordering::Relaxed) {
-					info!(peer = %addr, "BGP connection closed, not reconnecting (shutdown)");
-					return;
-				}
-				
-				info!(peer = %addr, "BGP connection closed, scheduling reconnect");
-			}
-		});
-	}
+    fn connect_given_client(
+        remote_asn: u32,
+        addr: SocketAddr,
+        timeout: Duration,
+        printer: &'static Printer,
+        client: Arc<BGPClient>,
+        identifier: u32,
+    ) {
+        info!(
+            peer = %addr,
+            remote_asn = remote_asn,
+            identifier = format_args!("0x{:08x}", identifier),
+            timeout_secs = timeout.as_secs(),
+            "Initiating BGP connection"
+        );
+        tokio::spawn(async move {
+            // Initial delay before connecting
+            sleep(timeout / 4).await;
+            debug!(peer = %addr, "Connection delay elapsed, attempting TCP connect");
 
-	pub fn new(remote_asn: u32, addr: SocketAddr, timeout: Duration, printer: &'static Printer, identifier: u32) -> Arc<BGPClient> {
-		info!(
-			peer = %addr,
-			remote_asn = remote_asn,
-			identifier = format_args!("0x{:08x}", identifier),
-			"Creating new BGP client"
-		);
-		let client = Arc::new(BGPClient {
-			routes: Mutex::new(RoutingTable::new()),
-			shutdown: AtomicBool::new(false),
-		});
-		BGPClient::connect_given_client(remote_asn, addr, timeout, printer, Arc::clone(&client), identifier);
-		client
-	}
+            loop {
+                // Try to connect with timeout
+                let stream = match tokio::time::timeout(timeout, TcpStream::connect(addr)).await {
+                    Ok(Ok(stream)) => stream,
+                    Ok(Err(e)) => {
+                        warn!(peer = %addr, error = ?e, "BGP TCP connection failed, will retry");
+                        sleep(timeout / 2).await;
+                        if client.shutdown.load(Ordering::Relaxed) {
+                            info!(peer = %addr, "BGP shutdown requested, not reconnecting");
+                            return;
+                        }
+                        continue;
+                    }
+                    Err(_) => {
+                        warn!("BGP connection timeout reached");
+                        sleep(timeout / 2).await;
+                        if client.shutdown.load(Ordering::Relaxed) {
+                            info!(peer = %addr, "BGP shutdown requested, not reconnecting");
+                            return;
+                        }
+                        continue;
+                    }
+                };
+
+                info!(peer = %addr, "BGP TCP connection established");
+                let (mut write, read) = Framed::new(stream, MsgCoder(None)).split();
+                let (sender, mut receiver) = mpsc::channel::<Message>(10);
+
+                // Spawn write task
+                tokio::spawn(async move {
+                    while let Some(msg) = receiver.recv().await {
+                        if write.send(msg).await.is_err() {
+                            error!("BGP write stream error");
+                            break;
+                        }
+                    }
+                    debug!("BGP write stream closed");
+                });
+
+                let peer_asn = if remote_asn > u16::max_value() as u32 {
+                    23456
+                } else {
+                    remote_asn as u16
+                };
+                debug!(
+                    peer = %addr,
+                    version = 4,
+                    peer_asn = peer_asn,
+                    actual_asn = remote_asn,
+                    hold_timer = timeout.as_secs(),
+                    identifier = format_args!("0x{:08x}", identifier),
+                    "Sending BGP OPEN message"
+                );
+                let _ = sender
+                    .send(Message::Open(Open {
+                        version: 4,
+                        peer_asn,
+                        hold_timer: timeout.as_secs() as u16,
+                        identifier,
+                        parameters: vec![OpenParameter::Capabilities(vec![
+                            OpenCapability::MultiProtocol((AFI::IPV4, SAFI::Unicast)),
+                            OpenCapability::MultiProtocol((AFI::IPV6, SAFI::Unicast)),
+                            OpenCapability::FourByteASN(remote_asn),
+                            OpenCapability::RouteRefresh,
+                            OpenCapability::AddPath(vec![
+                                (AFI::IPV4, SAFI::Unicast, AddPathDirection::ReceivePaths),
+                                (AFI::IPV6, SAFI::Unicast, AddPathDirection::ReceivePaths),
+                            ]),
+                        ])],
+                    }))
+                    .await;
+
+                // Process messages with timeout
+                let timed_read = TimeoutStream::new_persistent(read, timeout);
+                let mut timed_read = std::pin::pin!(timed_read);
+                while let Some(result) = timed_read.next().await {
+                    if client.shutdown.load(Ordering::Relaxed) {
+                        info!(peer = %addr, "BGP client shutdown requested");
+                        return;
+                    }
+
+                    let bgp_msg = match result {
+                        Ok(msg) => msg,
+                        Err(e) => {
+                            error!(peer = %addr, error = ?e, "BGP stream error");
+                            printer.add_line(format!("Got error from BGP stream: {:?}", e), true);
+                            break;
+                        }
+                    };
+
+                    match bgp_msg {
+                        Message::Open(ref open) => {
+                            info!(
+                                peer = %addr,
+                                remote_identifier = format_args!("0x{:08x}", open.identifier),
+                                remote_hold_timer = open.hold_timer,
+                                remote_version = open.version,
+                                "Received BGP OPEN, session established"
+                            );
+                            client.routes.lock().unwrap().v4_table.clear();
+                            client.routes.lock().unwrap().v6_table.clear();
+                            printer.add_line("Connected to BGP route provider".to_string(), false);
+                        }
+                        Message::KeepAlive => {
+                            trace!(peer = %addr, "Received BGP KEEPALIVE, sending response");
+                            let _ = sender.send(Message::KeepAlive).await;
+                        }
+                        Message::Update(mut upd) => {
+                            trace!(
+                                peer = %addr,
+                                withdrawn_count = upd.withdrawn_routes.len(),
+                                announced_count = upd.announced_routes.len(),
+                                attrs_count = upd.attributes.len(),
+                                "Received BGP UPDATE"
+                            );
+                            let _ = sender.send(Message::KeepAlive).await;
+                            upd.normalize();
+                            let mut route_table = client.routes.lock().unwrap();
+                            for r in upd.withdrawn_routes {
+                                trace!(route = ?r, "Withdrawing route");
+                                route_table.withdraw(r);
+                            }
+                            if let Some(path) = Self::map_attrs(upd.attributes) {
+                                for r in upd.announced_routes {
+                                    trace!(route = ?r, path_len = path.path_len, "Announcing route");
+                                    route_table.announce(r, path.clone());
+                                }
+                            }
+                            printer.set_stat(Stat::V4RoutingTableSize(route_table.v4_table.len()));
+                            printer.set_stat(Stat::V6RoutingTableSize(route_table.v6_table.len()));
+                            printer.set_stat(Stat::RoutingTablePaths(route_table.max_paths));
+                        }
+                        Message::Notification(notif) => {
+                            error!(
+                                peer = %addr,
+                                error_code = notif.major_err_code,
+                                error_subcode = notif.minor_err_code,
+                                data = ?notif.data,
+                                "Received BGP NOTIFICATION"
+                            );
+                        }
+                        msg => {
+                            debug!(peer = %addr, msg_type = ?std::mem::discriminant(&msg), "Received other BGP message");
+                        }
+                    }
+                }
+
+                // Connection closed, check if we should reconnect
+                if client.shutdown.load(Ordering::Relaxed) {
+                    info!(peer = %addr, "BGP connection closed, not reconnecting (shutdown)");
+                    return;
+                }
+
+                info!(peer = %addr, "BGP connection closed, scheduling reconnect");
+            }
+        });
+    }
+
+    pub fn new(
+        remote_asn: u32,
+        addr: SocketAddr,
+        timeout: Duration,
+        printer: &'static Printer,
+        identifier: u32,
+    ) -> Arc<BGPClient> {
+        info!(
+            peer = %addr,
+            remote_asn = remote_asn,
+            identifier = format_args!("0x{:08x}", identifier),
+            "Creating new BGP client"
+        );
+        let client = Arc::new(BGPClient {
+            routes: Mutex::new(RoutingTable::new()),
+            shutdown: AtomicBool::new(false),
+        });
+        BGPClient::connect_given_client(
+            remote_asn,
+            addr,
+            timeout,
+            printer,
+            Arc::clone(&client),
+            identifier,
+        );
+        client
+    }
 }

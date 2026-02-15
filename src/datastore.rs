@@ -1,680 +1,917 @@
 use std::cmp;
+use std::collections::{hash_map, HashMap, HashSet};
 use std::convert::TryInto;
-use std::collections::{HashSet, HashMap, hash_map};
-use std::sync::{Arc, RwLock};
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr, SocketAddrV4, SocketAddrV6};
+use std::sync::{Arc, RwLock};
 use std::time::{Duration, Instant};
 
-use bitcoin::p2p::address::{Address, AddrV2Message};
+use bitcoin::p2p::address::{AddrV2Message, Address};
 
 use rand::rng;
-use rand::seq::{SliceRandom, IteratorRandom};
+use rand::seq::{IteratorRandom, SliceRandom};
 
 use tokio::fs::File;
 use tokio::io::AsyncWriteExt;
 
 use regex::Regex;
 
-use crate::bloom::RollingBloomFilter;
 use crate::bgp_client::BGPClient;
+use crate::bloom::RollingBloomFilter;
 
 pub const SECS_PER_SCAN_RESULTS: u64 = 15;
 const MAX_CONNS_PER_SEC_PER_STATUS: u64 = 2500;
 
 #[derive(Clone, Copy, Hash, PartialEq, Eq)]
 pub enum AddressState {
-	Untested,
-	LowBlockCount,
-	HighBlockCount,
-	LowVersion,
-	BadVersion,
-	NotFullNode,
-	ProtocolViolation,
-	Timeout,
-	TimeoutDuringRequest,
-	TimeoutAwaitingPong,
-	TimeoutAwaitingAddr,
-	TimeoutAwaitingBlock,
-	Good,
-	WasGood,
-	EvilNode,
+    Untested,
+    LowBlockCount,
+    HighBlockCount,
+    LowVersion,
+    BadVersion,
+    NotFullNode,
+    ProtocolViolation,
+    Timeout,
+    TimeoutDuringRequest,
+    TimeoutAwaitingPong,
+    TimeoutAwaitingAddr,
+    TimeoutAwaitingBlock,
+    Good,
+    WasGood,
+    EvilNode,
 }
 
 impl AddressState {
-	pub fn from_num(num: u8) -> Option<AddressState> {
-		match num {
-			0x0 => Some(AddressState::Untested),
-			0x1 => Some(AddressState::LowBlockCount),
-			0x2 => Some(AddressState::HighBlockCount),
-			0x3 => Some(AddressState::LowVersion),
-			0x4 => Some(AddressState::BadVersion),
-			0x5 => Some(AddressState::NotFullNode),
-			0x6 => Some(AddressState::ProtocolViolation),
-			0x7 => Some(AddressState::Timeout),
-			0x8 => Some(AddressState::TimeoutDuringRequest),
-			0x9 => Some(AddressState::TimeoutAwaitingPong),
-			0xa => Some(AddressState::TimeoutAwaitingAddr),
-			0xb => Some(AddressState::TimeoutAwaitingBlock),
-			0xc => Some(AddressState::Good),
-			0xd => Some(AddressState::WasGood),
-			0xe => Some(AddressState::EvilNode),
-			_   => None,
-		}
-	}
+    pub fn from_num(num: u8) -> Option<AddressState> {
+        match num {
+            0x0 => Some(AddressState::Untested),
+            0x1 => Some(AddressState::LowBlockCount),
+            0x2 => Some(AddressState::HighBlockCount),
+            0x3 => Some(AddressState::LowVersion),
+            0x4 => Some(AddressState::BadVersion),
+            0x5 => Some(AddressState::NotFullNode),
+            0x6 => Some(AddressState::ProtocolViolation),
+            0x7 => Some(AddressState::Timeout),
+            0x8 => Some(AddressState::TimeoutDuringRequest),
+            0x9 => Some(AddressState::TimeoutAwaitingPong),
+            0xa => Some(AddressState::TimeoutAwaitingAddr),
+            0xb => Some(AddressState::TimeoutAwaitingBlock),
+            0xc => Some(AddressState::Good),
+            0xd => Some(AddressState::WasGood),
+            0xe => Some(AddressState::EvilNode),
+            _ => None,
+        }
+    }
 
-	pub fn to_num(&self) -> u8 {
-		match *self {
-			AddressState::Untested => 0,
-			AddressState::LowBlockCount => 1,
-			AddressState::HighBlockCount => 2,
-			AddressState::LowVersion => 3,
-			AddressState::BadVersion => 4,
-			AddressState::NotFullNode => 5,
-			AddressState::ProtocolViolation => 6,
-			AddressState::Timeout => 7,
-			AddressState::TimeoutDuringRequest => 8,
-			AddressState::TimeoutAwaitingPong => 9,
-			AddressState::TimeoutAwaitingAddr => 10,
-			AddressState::TimeoutAwaitingBlock => 11,
-			AddressState::Good => 12,
-			AddressState::WasGood => 13,
-			AddressState::EvilNode => 14,
-		}
-	}
+    pub fn to_num(&self) -> u8 {
+        match *self {
+            AddressState::Untested => 0,
+            AddressState::LowBlockCount => 1,
+            AddressState::HighBlockCount => 2,
+            AddressState::LowVersion => 3,
+            AddressState::BadVersion => 4,
+            AddressState::NotFullNode => 5,
+            AddressState::ProtocolViolation => 6,
+            AddressState::Timeout => 7,
+            AddressState::TimeoutDuringRequest => 8,
+            AddressState::TimeoutAwaitingPong => 9,
+            AddressState::TimeoutAwaitingAddr => 10,
+            AddressState::TimeoutAwaitingBlock => 11,
+            AddressState::Good => 12,
+            AddressState::WasGood => 13,
+            AddressState::EvilNode => 14,
+        }
+    }
 
-	pub fn to_str(&self) -> &'static str {
-		match *self {
-			AddressState::Untested => "Untested",
-			AddressState::LowBlockCount => "Low Block Count",
-			AddressState::HighBlockCount => "High Block Count",
-			AddressState::LowVersion => "Low Version",
-			AddressState::BadVersion => "Bad Version",
-			AddressState::NotFullNode => "Not Full Node",
-			AddressState::ProtocolViolation => "Protocol Violation",
-			AddressState::Timeout => "Timeout",
-			AddressState::TimeoutDuringRequest => "Timeout During Request",
-			AddressState::TimeoutAwaitingPong => "Timeout Awaiting Pong",
-			AddressState::TimeoutAwaitingAddr => "Timeout Awaiting Addr",
-			AddressState::TimeoutAwaitingBlock => "Timeout Awaiting Block",
-			AddressState::Good => "Good",
-			AddressState::WasGood => "Was Good",
-			AddressState::EvilNode => "Evil Node",
-		}
-	}
+    pub fn to_str(&self) -> &'static str {
+        match *self {
+            AddressState::Untested => "Untested",
+            AddressState::LowBlockCount => "Low Block Count",
+            AddressState::HighBlockCount => "High Block Count",
+            AddressState::LowVersion => "Low Version",
+            AddressState::BadVersion => "Bad Version",
+            AddressState::NotFullNode => "Not Full Node",
+            AddressState::ProtocolViolation => "Protocol Violation",
+            AddressState::Timeout => "Timeout",
+            AddressState::TimeoutDuringRequest => "Timeout During Request",
+            AddressState::TimeoutAwaitingPong => "Timeout Awaiting Pong",
+            AddressState::TimeoutAwaitingAddr => "Timeout Awaiting Addr",
+            AddressState::TimeoutAwaitingBlock => "Timeout Awaiting Block",
+            AddressState::Good => "Good",
+            AddressState::WasGood => "Was Good",
+            AddressState::EvilNode => "Evil Node",
+        }
+    }
 
-	pub const fn get_count() -> u8 {
-		15
-	}
+    pub const fn get_count() -> u8 {
+        15
+    }
 }
 
 #[derive(Hash, PartialEq, Eq)]
 pub enum U64Setting {
-	RunTimeout,
-	WasGoodTimeout,
-	RescanInterval(AddressState),
-	MinProtocolVersion,
+    RunTimeout,
+    WasGoodTimeout,
+    RescanInterval(AddressState),
+    MinProtocolVersion,
 }
 
 #[derive(Hash, PartialEq, Eq)]
 pub enum RegexSetting {
-	SubverRegex,
+    SubverRegex,
 }
 
 struct Node {
-	// Times in seconds-since-startup
-	last_good: u32, // Ignored unless state is Good or WasGood
-	// Since everything is is 4-byte aligned, using a u64 for services blows up our size
-	// substantially. Instead, use a u32 pair and bit shift as needed.
-	last_services: (u32, u32),
-	state: AddressState,
-	queued: bool,
+    // Times in seconds-since-startup
+    last_good: u32, // Ignored unless state is Good or WasGood
+    // Since everything is is 4-byte aligned, using a u64 for services blows up our size
+    // substantially. Instead, use a u32 pair and bit shift as needed.
+    last_services: (u32, u32),
+    state: AddressState,
+    queued: bool,
 }
 impl Node {
-	#[inline]
-	fn last_services(&self) -> u64 {
-		((self.last_services.0 as u64) << 32) |
-		((self.last_services.1 as u64)      )
-	}
-	#[inline]
-	fn services(inp: u64) -> (u32, u32) {
-		(
-			((inp & 0xffffffff00000000) >> 32) as u32,
-			((inp & 0x00000000ffffffff)      ) as u32
-		)
-	}
+    #[inline]
+    fn last_services(&self) -> u64 {
+        ((self.last_services.0 as u64) << 32) | (self.last_services.1 as u64)
+    }
+    #[inline]
+    fn services(inp: u64) -> (u32, u32) {
+        (
+            ((inp & 0xffffffff00000000) >> 32) as u32,
+            (inp & 0x00000000ffffffff) as u32,
+        )
+    }
 }
 
 #[test]
 fn services_test() {
-	assert_eq!(
-		Node { last_good: 0, state: AddressState::Good, queued: false, last_services: Node::services(0x1badcafedeadbeef) }
-			.last_services(),
-		0x1badcafedeadbeef);
+    assert_eq!(
+        Node {
+            last_good: 0,
+            state: AddressState::Good,
+            queued: false,
+            last_services: Node::services(0x1badcafedeadbeef)
+        }
+        .last_services(),
+        0x1badcafedeadbeef
+    );
 }
 
 /// Essentially SocketAddr but without a traffic class or scope
 #[derive(Clone, PartialEq, Eq, Hash)]
 enum SockAddr {
-	V4(SocketAddrV4),
-	V6(([u16; 8], u16)),
+    V4(SocketAddrV4),
+    V6(([u16; 8], u16)),
 }
 #[inline]
 fn segs_to_ip6(segs: &[u16; 8]) -> Ipv6Addr {
-	Ipv6Addr::new(segs[0], segs[1], segs[2], segs[3], segs[4], segs[5], segs[6], segs[7])
+    Ipv6Addr::new(
+        segs[0], segs[1], segs[2], segs[3], segs[4], segs[5], segs[6], segs[7],
+    )
 }
 impl From<SocketAddr> for SockAddr {
-	fn from(addr: SocketAddr) -> SockAddr {
-		match addr {
-			SocketAddr::V4(sa) => SockAddr::V4(sa),
-			SocketAddr::V6(sa) => SockAddr::V6((sa.ip().segments(), sa.port())),
-		}
-	}
+    fn from(addr: SocketAddr) -> SockAddr {
+        match addr {
+            SocketAddr::V4(sa) => SockAddr::V4(sa),
+            SocketAddr::V6(sa) => SockAddr::V6((sa.ip().segments(), sa.port())),
+        }
+    }
 }
 impl Into<SocketAddr> for &SockAddr {
-	fn into(self) -> SocketAddr {
-		match self {
-			&SockAddr::V4(sa) => SocketAddr::V4(sa),
-			&SockAddr::V6(sa) => SocketAddr::V6(SocketAddrV6::new(segs_to_ip6(&sa.0), sa.1, 0, 0))
-		}
-	}
+    fn into(self) -> SocketAddr {
+        match self {
+            &SockAddr::V4(sa) => SocketAddr::V4(sa),
+            &SockAddr::V6(sa) => SocketAddr::V6(SocketAddrV6::new(segs_to_ip6(&sa.0), sa.1, 0, 0)),
+        }
+    }
 }
 impl ToString for SockAddr {
-	fn to_string(&self) -> String {
-		let sa: SocketAddr = self.into();
-		sa.to_string()
-	}
+    fn to_string(&self) -> String {
+        let sa: SocketAddr = self.into();
+        sa.to_string()
+    }
 }
 impl SockAddr {
-	pub fn port(&self) -> u16 {
-		match *self {
-			SockAddr::V4(sa) => sa.port(),
-			SockAddr::V6((_, port)) => port,
-		}
-	}
-	pub fn ip(&self) -> IpAddr {
-		match *self {
-			SockAddr::V4(sa) => IpAddr::V4(sa.ip().clone()),
-			SockAddr::V6((ip, _)) => IpAddr::V6(segs_to_ip6(&ip)),
-		}
-	}
+    pub fn port(&self) -> u16 {
+        match *self {
+            SockAddr::V4(sa) => sa.port(),
+            SockAddr::V6((_, port)) => port,
+        }
+    }
+    pub fn ip(&self) -> IpAddr {
+        match *self {
+            SockAddr::V4(sa) => IpAddr::V4(sa.ip().clone()),
+            SockAddr::V6((ip, _)) => IpAddr::V6(segs_to_ip6(&ip)),
+        }
+    }
 }
 
 struct Nodes {
-	good_node_services: [HashSet<SockAddr>; 64],
-	nodes_to_state: HashMap<SockAddr, Node>,
-	state_next_scan: [Vec<SockAddr>; AddressState::get_count() as usize],
+    good_node_services: [HashSet<SockAddr>; 64],
+    nodes_to_state: HashMap<SockAddr, Node>,
+    state_next_scan: [Vec<SockAddr>; AddressState::get_count() as usize],
 }
 struct NodesMutRef<'a> {
-	good_node_services: &'a mut [HashSet<SockAddr>; 64],
-	nodes_to_state: &'a mut HashMap<SockAddr, Node>,
-	state_next_scan: &'a mut [Vec<SockAddr>; AddressState::get_count() as usize],
+    good_node_services: &'a mut [HashSet<SockAddr>; 64],
+    nodes_to_state: &'a mut HashMap<SockAddr, Node>,
+    state_next_scan: &'a mut [Vec<SockAddr>; AddressState::get_count() as usize],
 }
 
 impl Nodes {
-	fn borrow_mut<'a>(&'a mut self) -> NodesMutRef<'a> {
-		NodesMutRef {
-			good_node_services: &mut self.good_node_services,
-			nodes_to_state: &mut self.nodes_to_state,
-			state_next_scan: &mut self.state_next_scan,
-		}
-	}
+    fn borrow_mut<'a>(&'a mut self) -> NodesMutRef<'a> {
+        NodesMutRef {
+            good_node_services: &mut self.good_node_services,
+            nodes_to_state: &mut self.nodes_to_state,
+            state_next_scan: &mut self.state_next_scan,
+        }
+    }
 }
 
 pub struct Store {
-	u64_settings: RwLock<HashMap<U64Setting, u64>>,
-	subver_regex: RwLock<Arc<Regex>>,
-	nodes: RwLock<Nodes>,
-	timeout_nodes: RollingBloomFilter<SockAddr>,
-	start_time: Instant,
-	store: String,
+    u64_settings: RwLock<HashMap<U64Setting, u64>>,
+    subver_regex: RwLock<Arc<Regex>>,
+    nodes: RwLock<Nodes>,
+    timeout_nodes: RollingBloomFilter<SockAddr>,
+    start_time: Instant,
+    store: String,
 }
 
 impl Store {
-	pub async fn new(store: String) -> Result<Store, ()> {
-		// Load settings
-		let (u64_settings, regex) = match tokio::fs::read_to_string(store.clone() + "/settings").await {
-			Ok(content) => {
-				let mut lines = content.lines();
-				macro_rules! try_read {
-					($ty: ty) => {
-						match lines.next().and_then(|l| l.parse::<$ty>().ok()) {
-							Some(v) => v,
-							None => return Err(()),
-						}
-					}
-				}
-				let mut u64s = HashMap::with_capacity(AddressState::get_count() as usize + 4);
-				u64s.insert(U64Setting::RunTimeout, try_read!(u64));
-				u64s.insert(U64Setting::WasGoodTimeout, try_read!(u64));
-				u64s.insert(U64Setting::MinProtocolVersion, try_read!(u64));
-				u64s.insert(U64Setting::RescanInterval(AddressState::Untested), try_read!(u64));
-				u64s.insert(U64Setting::RescanInterval(AddressState::LowBlockCount), try_read!(u64));
-				u64s.insert(U64Setting::RescanInterval(AddressState::HighBlockCount), try_read!(u64));
-				u64s.insert(U64Setting::RescanInterval(AddressState::LowVersion), try_read!(u64));
-				u64s.insert(U64Setting::RescanInterval(AddressState::BadVersion), try_read!(u64));
-				u64s.insert(U64Setting::RescanInterval(AddressState::NotFullNode), try_read!(u64));
-				u64s.insert(U64Setting::RescanInterval(AddressState::ProtocolViolation), try_read!(u64));
-				u64s.insert(U64Setting::RescanInterval(AddressState::Timeout), try_read!(u64));
-				u64s.insert(U64Setting::RescanInterval(AddressState::TimeoutDuringRequest), try_read!(u64));
-				u64s.insert(U64Setting::RescanInterval(AddressState::TimeoutAwaitingPong), try_read!(u64));
-				u64s.insert(U64Setting::RescanInterval(AddressState::TimeoutAwaitingAddr), try_read!(u64));
-				u64s.insert(U64Setting::RescanInterval(AddressState::TimeoutAwaitingBlock), try_read!(u64));
-				u64s.insert(U64Setting::RescanInterval(AddressState::Good), try_read!(u64));
-				u64s.insert(U64Setting::RescanInterval(AddressState::WasGood), try_read!(u64));
-				u64s.insert(U64Setting::RescanInterval(AddressState::EvilNode), try_read!(u64));
-				let regex = try_read!(Regex);
-				(u64s, regex)
-			},
-			Err(_) => {
-				// Use defaults
-				let mut u64s = HashMap::with_capacity(15);
-				u64s.insert(U64Setting::RunTimeout, 120);
-				u64s.insert(U64Setting::WasGoodTimeout, 21600);
-				u64s.insert(U64Setting::RescanInterval(AddressState::Untested), 3600);
-				u64s.insert(U64Setting::RescanInterval(AddressState::LowBlockCount), 3600);
-				u64s.insert(U64Setting::RescanInterval(AddressState::HighBlockCount), 7200);
-				u64s.insert(U64Setting::RescanInterval(AddressState::LowVersion), 21600);
-				u64s.insert(U64Setting::RescanInterval(AddressState::BadVersion), 21600);
-				u64s.insert(U64Setting::RescanInterval(AddressState::NotFullNode), 86400);
-				u64s.insert(U64Setting::RescanInterval(AddressState::ProtocolViolation), 86400);
-				u64s.insert(U64Setting::RescanInterval(AddressState::Timeout), 604800);
-				u64s.insert(U64Setting::RescanInterval(AddressState::TimeoutDuringRequest), 21600);
-				u64s.insert(U64Setting::RescanInterval(AddressState::TimeoutAwaitingPong), 3600);
-				u64s.insert(U64Setting::RescanInterval(AddressState::TimeoutAwaitingAddr), 1800);
-				u64s.insert(U64Setting::RescanInterval(AddressState::TimeoutAwaitingBlock), 3600);
-				u64s.insert(U64Setting::RescanInterval(AddressState::Good), 1800);
-				u64s.insert(U64Setting::RescanInterval(AddressState::WasGood), 1800);
-				u64s.insert(U64Setting::RescanInterval(AddressState::EvilNode), 315360000);
-				u64s.insert(U64Setting::MinProtocolVersion, 70002);
-				(u64s, Regex::new(".*").unwrap())
-			}
-		};
+    pub async fn new(store: String) -> Result<Store, ()> {
+        // Load settings
+        let (u64_settings, regex) =
+            match tokio::fs::read_to_string(store.clone() + "/settings").await {
+                Ok(content) => {
+                    let mut lines = content.lines();
+                    macro_rules! try_read {
+                        ($ty: ty) => {
+                            match lines.next().and_then(|l| l.parse::<$ty>().ok()) {
+                                Some(v) => v,
+                                None => return Err(()),
+                            }
+                        };
+                    }
+                    let mut u64s = HashMap::with_capacity(AddressState::get_count() as usize + 4);
+                    u64s.insert(U64Setting::RunTimeout, try_read!(u64));
+                    u64s.insert(U64Setting::WasGoodTimeout, try_read!(u64));
+                    u64s.insert(U64Setting::MinProtocolVersion, try_read!(u64));
+                    u64s.insert(
+                        U64Setting::RescanInterval(AddressState::Untested),
+                        try_read!(u64),
+                    );
+                    u64s.insert(
+                        U64Setting::RescanInterval(AddressState::LowBlockCount),
+                        try_read!(u64),
+                    );
+                    u64s.insert(
+                        U64Setting::RescanInterval(AddressState::HighBlockCount),
+                        try_read!(u64),
+                    );
+                    u64s.insert(
+                        U64Setting::RescanInterval(AddressState::LowVersion),
+                        try_read!(u64),
+                    );
+                    u64s.insert(
+                        U64Setting::RescanInterval(AddressState::BadVersion),
+                        try_read!(u64),
+                    );
+                    u64s.insert(
+                        U64Setting::RescanInterval(AddressState::NotFullNode),
+                        try_read!(u64),
+                    );
+                    u64s.insert(
+                        U64Setting::RescanInterval(AddressState::ProtocolViolation),
+                        try_read!(u64),
+                    );
+                    u64s.insert(
+                        U64Setting::RescanInterval(AddressState::Timeout),
+                        try_read!(u64),
+                    );
+                    u64s.insert(
+                        U64Setting::RescanInterval(AddressState::TimeoutDuringRequest),
+                        try_read!(u64),
+                    );
+                    u64s.insert(
+                        U64Setting::RescanInterval(AddressState::TimeoutAwaitingPong),
+                        try_read!(u64),
+                    );
+                    u64s.insert(
+                        U64Setting::RescanInterval(AddressState::TimeoutAwaitingAddr),
+                        try_read!(u64),
+                    );
+                    u64s.insert(
+                        U64Setting::RescanInterval(AddressState::TimeoutAwaitingBlock),
+                        try_read!(u64),
+                    );
+                    u64s.insert(
+                        U64Setting::RescanInterval(AddressState::Good),
+                        try_read!(u64),
+                    );
+                    u64s.insert(
+                        U64Setting::RescanInterval(AddressState::WasGood),
+                        try_read!(u64),
+                    );
+                    u64s.insert(
+                        U64Setting::RescanInterval(AddressState::EvilNode),
+                        try_read!(u64),
+                    );
+                    let regex = try_read!(Regex);
+                    (u64s, regex)
+                }
+                Err(_) => {
+                    // Use defaults
+                    let mut u64s = HashMap::with_capacity(15);
+                    u64s.insert(U64Setting::RunTimeout, 120);
+                    u64s.insert(U64Setting::WasGoodTimeout, 21600);
+                    u64s.insert(U64Setting::RescanInterval(AddressState::Untested), 3600);
+                    u64s.insert(
+                        U64Setting::RescanInterval(AddressState::LowBlockCount),
+                        3600,
+                    );
+                    u64s.insert(
+                        U64Setting::RescanInterval(AddressState::HighBlockCount),
+                        7200,
+                    );
+                    u64s.insert(U64Setting::RescanInterval(AddressState::LowVersion), 21600);
+                    u64s.insert(U64Setting::RescanInterval(AddressState::BadVersion), 21600);
+                    u64s.insert(U64Setting::RescanInterval(AddressState::NotFullNode), 86400);
+                    u64s.insert(
+                        U64Setting::RescanInterval(AddressState::ProtocolViolation),
+                        86400,
+                    );
+                    u64s.insert(U64Setting::RescanInterval(AddressState::Timeout), 604800);
+                    u64s.insert(
+                        U64Setting::RescanInterval(AddressState::TimeoutDuringRequest),
+                        21600,
+                    );
+                    u64s.insert(
+                        U64Setting::RescanInterval(AddressState::TimeoutAwaitingPong),
+                        3600,
+                    );
+                    u64s.insert(
+                        U64Setting::RescanInterval(AddressState::TimeoutAwaitingAddr),
+                        1800,
+                    );
+                    u64s.insert(
+                        U64Setting::RescanInterval(AddressState::TimeoutAwaitingBlock),
+                        3600,
+                    );
+                    u64s.insert(U64Setting::RescanInterval(AddressState::Good), 1800);
+                    u64s.insert(U64Setting::RescanInterval(AddressState::WasGood), 1800);
+                    u64s.insert(
+                        U64Setting::RescanInterval(AddressState::EvilNode),
+                        315360000,
+                    );
+                    u64s.insert(U64Setting::MinProtocolVersion, 70002);
+                    (u64s, Regex::new(".*").unwrap())
+                }
+            };
 
-		macro_rules! nodes_uninitd {
-			() => { {
-				let state_vecs = [Vec::new(), Vec::new(), Vec::new(), Vec::new(), Vec::new(), Vec::new(), Vec::new(), Vec::new(), Vec::new(), Vec::new(), Vec::new(), Vec::new(), Vec::new(), Vec::new(), Vec::new()];
-				let good_node_services = [HashSet::new(), HashSet::new(), HashSet::new(), HashSet::new(), HashSet::new(), HashSet::new(), HashSet::new(), HashSet::new(), HashSet::new(), HashSet::new(), HashSet::new(), HashSet::new(), HashSet::new(), HashSet::new(), HashSet::new(), HashSet::new(), HashSet::new(), HashSet::new(), HashSet::new(), HashSet::new(), HashSet::new(), HashSet::new(), HashSet::new(), HashSet::new(), HashSet::new(), HashSet::new(), HashSet::new(), HashSet::new(), HashSet::new(), HashSet::new(), HashSet::new(), HashSet::new(), HashSet::new(), HashSet::new(), HashSet::new(), HashSet::new(), HashSet::new(), HashSet::new(), HashSet::new(), HashSet::new(), HashSet::new(), HashSet::new(), HashSet::new(), HashSet::new(), HashSet::new(), HashSet::new(), HashSet::new(), HashSet::new(), HashSet::new(), HashSet::new(), HashSet::new(), HashSet::new(), HashSet::new(), HashSet::new(), HashSet::new(), HashSet::new(), HashSet::new(), HashSet::new(), HashSet::new(), HashSet::new(), HashSet::new(), HashSet::new(), HashSet::new(), HashSet::new()];
-				Nodes {
-					good_node_services,
-					nodes_to_state: HashMap::new(),
-					state_next_scan: state_vecs,
-				}
-			} }
-		}
+        macro_rules! nodes_uninitd {
+            () => {{
+                let state_vecs = [
+                    Vec::new(),
+                    Vec::new(),
+                    Vec::new(),
+                    Vec::new(),
+                    Vec::new(),
+                    Vec::new(),
+                    Vec::new(),
+                    Vec::new(),
+                    Vec::new(),
+                    Vec::new(),
+                    Vec::new(),
+                    Vec::new(),
+                    Vec::new(),
+                    Vec::new(),
+                    Vec::new(),
+                ];
+                let good_node_services = [
+                    HashSet::new(),
+                    HashSet::new(),
+                    HashSet::new(),
+                    HashSet::new(),
+                    HashSet::new(),
+                    HashSet::new(),
+                    HashSet::new(),
+                    HashSet::new(),
+                    HashSet::new(),
+                    HashSet::new(),
+                    HashSet::new(),
+                    HashSet::new(),
+                    HashSet::new(),
+                    HashSet::new(),
+                    HashSet::new(),
+                    HashSet::new(),
+                    HashSet::new(),
+                    HashSet::new(),
+                    HashSet::new(),
+                    HashSet::new(),
+                    HashSet::new(),
+                    HashSet::new(),
+                    HashSet::new(),
+                    HashSet::new(),
+                    HashSet::new(),
+                    HashSet::new(),
+                    HashSet::new(),
+                    HashSet::new(),
+                    HashSet::new(),
+                    HashSet::new(),
+                    HashSet::new(),
+                    HashSet::new(),
+                    HashSet::new(),
+                    HashSet::new(),
+                    HashSet::new(),
+                    HashSet::new(),
+                    HashSet::new(),
+                    HashSet::new(),
+                    HashSet::new(),
+                    HashSet::new(),
+                    HashSet::new(),
+                    HashSet::new(),
+                    HashSet::new(),
+                    HashSet::new(),
+                    HashSet::new(),
+                    HashSet::new(),
+                    HashSet::new(),
+                    HashSet::new(),
+                    HashSet::new(),
+                    HashSet::new(),
+                    HashSet::new(),
+                    HashSet::new(),
+                    HashSet::new(),
+                    HashSet::new(),
+                    HashSet::new(),
+                    HashSet::new(),
+                    HashSet::new(),
+                    HashSet::new(),
+                    HashSet::new(),
+                    HashSet::new(),
+                    HashSet::new(),
+                    HashSet::new(),
+                    HashSet::new(),
+                    HashSet::new(),
+                ];
+                Nodes {
+                    good_node_services,
+                    nodes_to_state: HashMap::new(),
+                    state_next_scan: state_vecs,
+                }
+            }};
+        }
 
-		// Load nodes
-		let nodes = match tokio::fs::read_to_string(store.clone() + "/nodes").await {
-			Ok(content) => {
-				let mut res = nodes_uninitd!();
-				for line in content.lines() {
-					let mut line_iter = line.split(',');
-					macro_rules! try_read {
-						($ty: ty) => {
-							match line_iter.next().and_then(|s| s.parse::<$ty>().ok()) {
-								Some(v) => v,
-								None => continue,
-							}
-						}
-					}
-					let sockaddr = try_read!(SocketAddr);
-					let state = try_read!(u8);
-					let last_services = try_read!(u64);
-					let node = Node {
-						state: match AddressState::from_num(state) {
-							Some(v) => v,
-							None => continue,
-						},
-						last_services: Node::services(last_services),
-						last_good: 0,
-						queued: true,
-					};
-					if node.state == AddressState::Good {
-						for i in 0..64 {
-							if node.last_services() & (1 << i) != 0 {
-								res.good_node_services[i].insert(sockaddr.into());
-							}
-						}
-					}
-					res.state_next_scan[node.state.to_num() as usize].push(sockaddr.into());
-					res.nodes_to_state.insert(sockaddr.into(), node);
-				}
-				res
-			},
-			Err(_) => nodes_uninitd!(),
-		};
+        // Load nodes
+        let nodes = match tokio::fs::read_to_string(store.clone() + "/nodes").await {
+            Ok(content) => {
+                let mut res = nodes_uninitd!();
+                for line in content.lines() {
+                    let mut line_iter = line.split(',');
+                    macro_rules! try_read {
+                        ($ty: ty) => {
+                            match line_iter.next().and_then(|s| s.parse::<$ty>().ok()) {
+                                Some(v) => v,
+                                None => continue,
+                            }
+                        };
+                    }
+                    let sockaddr = try_read!(SocketAddr);
+                    let state = try_read!(u8);
+                    let last_services = try_read!(u64);
+                    let node = Node {
+                        state: match AddressState::from_num(state) {
+                            Some(v) => v,
+                            None => continue,
+                        },
+                        last_services: Node::services(last_services),
+                        last_good: 0,
+                        queued: true,
+                    };
+                    if node.state == AddressState::Good {
+                        for i in 0..64 {
+                            if node.last_services() & (1 << i) != 0 {
+                                res.good_node_services[i].insert(sockaddr.into());
+                            }
+                        }
+                    }
+                    res.state_next_scan[node.state.to_num() as usize].push(sockaddr.into());
+                    res.nodes_to_state.insert(sockaddr.into(), node);
+                }
+                res
+            }
+            Err(_) => nodes_uninitd!(),
+        };
 
-		Ok(Store {
-			u64_settings: RwLock::new(u64_settings),
-			subver_regex: RwLock::new(Arc::new(regex)),
-			nodes: RwLock::new(nodes),
-			timeout_nodes: RollingBloomFilter::new(),
-			store,
-			start_time: Instant::now(),
-		})
-	}
+        Ok(Store {
+            u64_settings: RwLock::new(u64_settings),
+            subver_regex: RwLock::new(Arc::new(regex)),
+            nodes: RwLock::new(nodes),
+            timeout_nodes: RollingBloomFilter::new(),
+            store,
+            start_time: Instant::now(),
+        })
+    }
 
-	pub fn get_u64(&self, setting: U64Setting) -> u64 {
-		*self.u64_settings.read().unwrap().get(&setting).unwrap()
-	}
+    pub fn get_u64(&self, setting: U64Setting) -> u64 {
+        *self.u64_settings.read().unwrap().get(&setting).unwrap()
+    }
 
-	pub fn set_u64(&self, setting: U64Setting, value: u64) {
-		*self.u64_settings.write().unwrap().get_mut(&setting).unwrap() = value;
-	}
+    pub fn set_u64(&self, setting: U64Setting, value: u64) {
+        *self
+            .u64_settings
+            .write()
+            .unwrap()
+            .get_mut(&setting)
+            .unwrap() = value;
+    }
 
-	pub fn get_node_count(&self, state: AddressState) -> usize {
-		self.nodes.read().unwrap().state_next_scan[state.to_num() as usize].len()
-	}
-	pub fn get_bloom_node_count(&self) -> [usize; crate::bloom::GENERATION_COUNT] {
-		self.timeout_nodes.get_element_count()
-	}
+    pub fn get_node_count(&self, state: AddressState) -> usize {
+        self.nodes.read().unwrap().state_next_scan[state.to_num() as usize].len()
+    }
+    pub fn get_bloom_node_count(&self) -> [usize; crate::bloom::GENERATION_COUNT] {
+        self.timeout_nodes.get_element_count()
+    }
 
-	pub fn get_regex(&self, _setting: RegexSetting) -> Arc<Regex> {
-		Arc::clone(&*self.subver_regex.read().unwrap())
-	}
+    pub fn get_regex(&self, _setting: RegexSetting) -> Arc<Regex> {
+        Arc::clone(&*self.subver_regex.read().unwrap())
+    }
 
-	pub fn set_regex(&self, _setting: RegexSetting, value: Regex) {
-		*self.subver_regex.write().unwrap() = Arc::new(value);
-	}
+    pub fn set_regex(&self, _setting: RegexSetting, value: Regex) {
+        *self.subver_regex.write().unwrap() = Arc::new(value);
+    }
 
-	pub fn add_fresh_addrs<I: Iterator<Item=SocketAddr>>(&self, addresses: I) -> u64 {
-		let mut res = 0;
-		let cur_time = (Instant::now() - self.start_time).as_secs().try_into().unwrap();
-		let mut nodes = self.nodes.write().unwrap();
-		for addr in addresses {
-			match nodes.nodes_to_state.entry(addr.into()) {
-				hash_map::Entry::Vacant(e) => {
-					e.insert(Node {
-						state: AddressState::Untested,
-						last_services: (0, 0),
-						last_good: cur_time,
-						queued: true,
-					});
-					nodes.state_next_scan[AddressState::Untested.to_num() as usize].push(addr.into());
-					res += 1;
-				},
-				hash_map::Entry::Occupied(_) => {},
-			}
-		}
-		res
-	}
+    pub fn add_fresh_addrs<I: Iterator<Item = SocketAddr>>(&self, addresses: I) -> u64 {
+        let mut res = 0;
+        let cur_time = (Instant::now() - self.start_time)
+            .as_secs()
+            .try_into()
+            .unwrap();
+        let mut nodes = self.nodes.write().unwrap();
+        for addr in addresses {
+            match nodes.nodes_to_state.entry(addr.into()) {
+                hash_map::Entry::Vacant(e) => {
+                    e.insert(Node {
+                        state: AddressState::Untested,
+                        last_services: (0, 0),
+                        last_good: cur_time,
+                        queued: true,
+                    });
+                    nodes.state_next_scan[AddressState::Untested.to_num() as usize]
+                        .push(addr.into());
+                    res += 1;
+                }
+                hash_map::Entry::Occupied(_) => {}
+            }
+        }
+        res
+    }
 
-	pub fn add_fresh_nodes(&self, addresses: &Vec<(u32, Address)>) {
-		self.add_fresh_addrs(addresses.iter().filter_map(|(_, addr)| {
-			match addr.socket_addr() {
-				Ok(socketaddr) => Some(socketaddr),
-				Err(_) => None, // TODO: Handle onions
-			}
-		}));
-	}
-	pub fn add_fresh_nodes_v2(&self, addresses: &Vec<AddrV2Message>) {
-		self.add_fresh_addrs(addresses.iter().filter_map(|addr| {
-			match addr.socket_addr() {
-				Ok(socketaddr) => Some(socketaddr),
-				Err(_) => None, // TODO: Handle onions
-			}
-		}));
-	}
+    pub fn add_fresh_nodes(&self, addresses: &Vec<(u32, Address)>) {
+        self.add_fresh_addrs(addresses.iter().filter_map(|(_, addr)| {
+            match addr.socket_addr() {
+                Ok(socketaddr) => Some(socketaddr),
+                Err(_) => None, // TODO: Handle onions
+            }
+        }));
+    }
+    pub fn add_fresh_nodes_v2(&self, addresses: &Vec<AddrV2Message>) {
+        self.add_fresh_addrs(addresses.iter().filter_map(|addr| {
+            match addr.socket_addr() {
+                Ok(socketaddr) => Some(socketaddr),
+                Err(_) => None, // TODO: Handle onions
+            }
+        }));
+    }
 
-	pub fn set_node_state(&self, sockaddr: SocketAddr, state: AddressState, services: u64) -> AddressState {
-		let addr: SockAddr = sockaddr.into();
+    pub fn set_node_state(
+        &self,
+        sockaddr: SocketAddr,
+        state: AddressState,
+        services: u64,
+    ) -> AddressState {
+        let addr: SockAddr = sockaddr.into();
 
-		if state == AddressState::Untested && self.timeout_nodes.contains(&addr) {
-			return AddressState::Timeout;
-		}
+        if state == AddressState::Untested && self.timeout_nodes.contains(&addr) {
+            return AddressState::Timeout;
+        }
 
-		let now = (Instant::now() - self.start_time).as_secs().try_into().unwrap();
+        let now = (Instant::now() - self.start_time)
+            .as_secs()
+            .try_into()
+            .unwrap();
 
-		let mut nodes_lock = self.nodes.write().unwrap();
-		let nodes = nodes_lock.borrow_mut();
+        let mut nodes_lock = self.nodes.write().unwrap();
+        let nodes = nodes_lock.borrow_mut();
 
-		let node_entry = nodes.nodes_to_state.entry(addr.clone());
-		match node_entry {
-			hash_map::Entry::Occupied(entry)
-					if entry.get().state == AddressState::Untested &&
-					   entry.get().last_services() == 0 &&
-					   state == AddressState::Timeout => {
-				entry.remove_entry();
-				self.timeout_nodes.insert(&addr, Duration::from_secs(self.get_u64(U64Setting::RescanInterval(AddressState::Timeout))));
-				return AddressState::Untested;
-			},
-			hash_map::Entry::Vacant(_) if state == AddressState::Timeout => {
-				self.timeout_nodes.insert(&addr, Duration::from_secs(self.get_u64(U64Setting::RescanInterval(AddressState::Timeout))));
-				return AddressState::Untested;
-			},
-			_ => {},
-		}
+        let node_entry = nodes.nodes_to_state.entry(addr.clone());
+        match node_entry {
+            hash_map::Entry::Occupied(entry)
+                if entry.get().state == AddressState::Untested
+                    && entry.get().last_services() == 0
+                    && state == AddressState::Timeout =>
+            {
+                entry.remove_entry();
+                self.timeout_nodes.insert(
+                    &addr,
+                    Duration::from_secs(
+                        self.get_u64(U64Setting::RescanInterval(AddressState::Timeout)),
+                    ),
+                );
+                return AddressState::Untested;
+            }
+            hash_map::Entry::Vacant(_) if state == AddressState::Timeout => {
+                self.timeout_nodes.insert(
+                    &addr,
+                    Duration::from_secs(
+                        self.get_u64(U64Setting::RescanInterval(AddressState::Timeout)),
+                    ),
+                );
+                return AddressState::Untested;
+            }
+            _ => {}
+        }
 
-		let state_ref = node_entry.or_insert(Node {
-			state: AddressState::Untested,
-			last_services: (0, 0),
-			last_good: now,
-			queued: false,
-		});
-		let ret = state_ref.state;
-		let was_good_timeout: u32 = self.get_u64(U64Setting::WasGoodTimeout)
-			.try_into().expect("Need WasGood timeout that fits in a u32");
-		if (state_ref.state == AddressState::Good || state_ref.state == AddressState::WasGood)
-				&& state != AddressState::Good
-				&& state_ref.last_good >= now - was_good_timeout {
-			state_ref.state = AddressState::WasGood;
-			for i in 0..64 {
-				if state_ref.last_services() & (1 << i) != 0 {
-					nodes.good_node_services[i].remove(&addr);
-				}
-			}
-			if !state_ref.queued {
-				nodes.state_next_scan[AddressState::WasGood.to_num() as usize].push(addr);
-				state_ref.queued = true;
-			}
-		} else {
-			state_ref.state = state;
-			if state == AddressState::Good {
-				for i in 0..64 {
-					if services & (1 << i) != 0 && state_ref.last_services() & (1 << i) == 0 {
-						nodes.good_node_services[i].insert(addr.clone());
-					} else if services & (1 << i) == 0 && state_ref.last_services() & (1 << i) != 0 {
-						nodes.good_node_services[i].remove(&addr);
-					}
-				}
-				state_ref.last_services = Node::services(services);
-				state_ref.last_good = now;
-			}
-			if !state_ref.queued {
-				nodes.state_next_scan[state.to_num() as usize].push(addr);
-				state_ref.queued = true;
-			}
-		}
-		ret
-	}
+        let state_ref = node_entry.or_insert(Node {
+            state: AddressState::Untested,
+            last_services: (0, 0),
+            last_good: now,
+            queued: false,
+        });
+        let ret = state_ref.state;
+        let was_good_timeout: u32 = self
+            .get_u64(U64Setting::WasGoodTimeout)
+            .try_into()
+            .expect("Need WasGood timeout that fits in a u32");
+        if (state_ref.state == AddressState::Good || state_ref.state == AddressState::WasGood)
+            && state != AddressState::Good
+            && state_ref.last_good >= now - was_good_timeout
+        {
+            state_ref.state = AddressState::WasGood;
+            for i in 0..64 {
+                if state_ref.last_services() & (1 << i) != 0 {
+                    nodes.good_node_services[i].remove(&addr);
+                }
+            }
+            if !state_ref.queued {
+                nodes.state_next_scan[AddressState::WasGood.to_num() as usize].push(addr);
+                state_ref.queued = true;
+            }
+        } else {
+            state_ref.state = state;
+            if state == AddressState::Good {
+                for i in 0..64 {
+                    if services & (1 << i) != 0 && state_ref.last_services() & (1 << i) == 0 {
+                        nodes.good_node_services[i].insert(addr.clone());
+                    } else if services & (1 << i) == 0 && state_ref.last_services() & (1 << i) != 0
+                    {
+                        nodes.good_node_services[i].remove(&addr);
+                    }
+                }
+                state_ref.last_services = Node::services(services);
+                state_ref.last_good = now;
+            }
+            if !state_ref.queued {
+                nodes.state_next_scan[state.to_num() as usize].push(addr);
+                state_ref.queued = true;
+            }
+        }
+        ret
+    }
 
-	pub async fn save_data(&'static self) {
-		let settings_file = self.store.clone() + "/settings";
-		let settings_string = format!("{}\n{}\n{}\n{}\n{}\n{}\n{}\n{}\n{}\n{}\n{}\n{}\n{}\n{}\n{}\n{}\n{}\n{}\n{}",
-			self.get_u64(U64Setting::RunTimeout),
-			self.get_u64(U64Setting::WasGoodTimeout),
-			self.get_u64(U64Setting::MinProtocolVersion),
-			self.get_u64(U64Setting::RescanInterval(AddressState::Untested)),
-			self.get_u64(U64Setting::RescanInterval(AddressState::LowBlockCount)),
-			self.get_u64(U64Setting::RescanInterval(AddressState::HighBlockCount)),
-			self.get_u64(U64Setting::RescanInterval(AddressState::LowVersion)),
-			self.get_u64(U64Setting::RescanInterval(AddressState::BadVersion)),
-			self.get_u64(U64Setting::RescanInterval(AddressState::NotFullNode)),
-			self.get_u64(U64Setting::RescanInterval(AddressState::ProtocolViolation)),
-			self.get_u64(U64Setting::RescanInterval(AddressState::Timeout)),
-			self.get_u64(U64Setting::RescanInterval(AddressState::TimeoutDuringRequest)),
-			self.get_u64(U64Setting::RescanInterval(AddressState::TimeoutAwaitingPong)),
-			self.get_u64(U64Setting::RescanInterval(AddressState::TimeoutAwaitingAddr)),
-			self.get_u64(U64Setting::RescanInterval(AddressState::TimeoutAwaitingBlock)),
-			self.get_u64(U64Setting::RescanInterval(AddressState::Good)),
-			self.get_u64(U64Setting::RescanInterval(AddressState::WasGood)),
-			self.get_u64(U64Setting::RescanInterval(AddressState::EvilNode)),
-			self.get_regex(RegexSetting::SubverRegex).as_str());
-		
-		if let Ok(mut f) = File::create(settings_file.clone() + ".tmp").await {
-			let _ = f.write_all(settings_string.as_bytes()).await;
-			let _ = f.sync_all().await;
-			let _ = tokio::fs::rename(settings_file.clone() + ".tmp", &settings_file).await;
-		}
+    pub async fn save_data(&'static self) {
+        let settings_file = self.store.clone() + "/settings";
+        let settings_string = format!(
+            "{}\n{}\n{}\n{}\n{}\n{}\n{}\n{}\n{}\n{}\n{}\n{}\n{}\n{}\n{}\n{}\n{}\n{}\n{}",
+            self.get_u64(U64Setting::RunTimeout),
+            self.get_u64(U64Setting::WasGoodTimeout),
+            self.get_u64(U64Setting::MinProtocolVersion),
+            self.get_u64(U64Setting::RescanInterval(AddressState::Untested)),
+            self.get_u64(U64Setting::RescanInterval(AddressState::LowBlockCount)),
+            self.get_u64(U64Setting::RescanInterval(AddressState::HighBlockCount)),
+            self.get_u64(U64Setting::RescanInterval(AddressState::LowVersion)),
+            self.get_u64(U64Setting::RescanInterval(AddressState::BadVersion)),
+            self.get_u64(U64Setting::RescanInterval(AddressState::NotFullNode)),
+            self.get_u64(U64Setting::RescanInterval(AddressState::ProtocolViolation)),
+            self.get_u64(U64Setting::RescanInterval(AddressState::Timeout)),
+            self.get_u64(U64Setting::RescanInterval(
+                AddressState::TimeoutDuringRequest
+            )),
+            self.get_u64(U64Setting::RescanInterval(
+                AddressState::TimeoutAwaitingPong
+            )),
+            self.get_u64(U64Setting::RescanInterval(
+                AddressState::TimeoutAwaitingAddr
+            )),
+            self.get_u64(U64Setting::RescanInterval(
+                AddressState::TimeoutAwaitingBlock
+            )),
+            self.get_u64(U64Setting::RescanInterval(AddressState::Good)),
+            self.get_u64(U64Setting::RescanInterval(AddressState::WasGood)),
+            self.get_u64(U64Setting::RescanInterval(AddressState::EvilNode)),
+            self.get_regex(RegexSetting::SubverRegex).as_str()
+        );
 
-		let nodes_file = self.store.clone() + "/nodes";
-		let mut nodes_buff = String::new();
-		{
-			let nodes = self.nodes.read().unwrap();
-			nodes_buff.reserve(nodes.nodes_to_state.len() * 32);
-			for (ref sockaddr, ref node) in nodes.nodes_to_state.iter() {
-				nodes_buff += &sockaddr.to_string();
-				nodes_buff += ",";
-				nodes_buff += &node.state.to_num().to_string();
-				nodes_buff += ",";
-				nodes_buff += &node.last_services().to_string();
-				nodes_buff += "\n";
-			}
-		}
-		
-		if let Ok(mut f) = File::create(nodes_file.clone() + ".tmp").await {
-			let _ = f.write_all(nodes_buff.as_bytes()).await;
-			let _ = f.sync_all().await;
-			let _ = tokio::fs::rename(nodes_file.clone() + ".tmp", &nodes_file).await;
-		}
-	}
+        if let Ok(mut f) = File::create(settings_file.clone() + ".tmp").await {
+            let _ = f.write_all(settings_string.as_bytes()).await;
+            let _ = f.sync_all().await;
+            let _ = tokio::fs::rename(settings_file.clone() + ".tmp", &settings_file).await;
+        }
 
-	pub async fn write_dns(&'static self, bgp_client: Arc<BGPClient>) {
-		let dns_file = self.store.clone() + "/nodes.dump";
-		let mut dns_buff = String::new();
-		{
-			let mut rng = rng();
-			for i in &[ 0b00000000001u64,
-			            0b00000000100,
-			            0b00000000101,
-			            0b00000001000,
-			            0b00000001001,
-			            0b00000001100,
-			            0b00000001101,
-			            0b00001001001,
-			            0b10000000000,
-			            0b10000000001,
-			            0b10000000100,
-			            0b10000000101,
-			            0b10000001000,
-			            0b10000001001,
-			            0b10000001100,
-			            0b10000001101,
-			            0b10001001000] {
-			//            ^ NODE_NETWORK_LIIMTED
-			//COMPACT_FILTERS ^   ^ NODE_BLOOM
-			//      NODE_WITNESS ^  ^ NODE_NETWORK
-			// We support all combos of NETWORK, NETWORK_LIMITED, BLOOM, and WITNESS
-			// We support COMPACT_FILTERS with WITNESS and NETWORK or NETWORK_LIIMTED.
-				let mut tor_set: Vec<Ipv6Addr> = Vec::new();
-				let mut v6_set: Vec<Ipv6Addr> = Vec::new();
-				let mut v4_set: Vec<Ipv4Addr> = Vec::new();
-				macro_rules! add_addr { ($addr: expr) => {
-					match $addr.ip() {
-						IpAddr::V4(v4addr) => v4_set.push(v4addr),
-						IpAddr::V6(v6addr) if v6addr.octets()[..6] == [0xFD,0x87,0xD8,0x7E,0xEB,0x43][..] => tor_set.push(v6addr),
-						IpAddr::V6(v6addr) => v6_set.push(v6addr),
-					}
-				} }
-				{
-					let nodes = self.nodes.read().unwrap();
-					if i.count_ones() == 1 {
-						for j in 0..64 {
-							if i & (1 << j) != 0 {
-								let set_ref = &nodes.good_node_services[j];
-								for a in set_ref.iter().filter(|e| e.port() == 8333) {
-									add_addr!(a);
-								}
-								break;
-							}
-						}
-					} else if i.count_ones() == 2 {
-						let mut first_set = None;
-						let mut second_set = None;
-						for j in 0..64 {
-							if i & (1 << j) != 0 {
-								if first_set == None {
-									first_set = Some(&nodes.good_node_services[j]);
-								} else {
-									second_set = Some(&nodes.good_node_services[j]);
-									break;
-								}
-							}
-						}
-						for a in first_set.unwrap().intersection(&second_set.unwrap()).filter(|e| e.port() == 8333) {
-							add_addr!(a);
-						}
-					} else {
-						//TODO: Could optimize this one a bit
-						let mut intersection;
-						let mut intersection_set_ref = None;
-						for j in 0..64 {
-							if i & (1 << j) != 0 {
-								if intersection_set_ref == None {
-									intersection_set_ref = Some(&nodes.good_node_services[j]);
-								} else {
-									let new_intersection = intersection_set_ref.unwrap()
-										.intersection(&nodes.good_node_services[j]).map(|e| (*e).clone()).collect();
-									intersection = Some(new_intersection);
-									intersection_set_ref = Some(intersection.as_ref().unwrap());
-								}
-							}
-						}
-						for a in intersection_set_ref.unwrap().iter().filter(|e| e.port() == 8333) {
-							add_addr!(a);
-						}
-					}
-				}
-				let mut asn_set = HashSet::with_capacity(cmp::max(v4_set.len(), v6_set.len()));
-				asn_set.insert(0);
-				let default = 1u64;
-				for a in v4_set.iter().filter(|a| asn_set.insert(bgp_client.get_asn(IpAddr::V4(**a)))).sample(&mut rng, 21) {
-					if i == &default {
-						dns_buff += &format!("seed\tIN\tA\t{}\n", a);
-					}
-					dns_buff += &format!("x{:x}.seed\tIN\tA\t{}\n", i, a);
-				}
-				asn_set.clear();
-				asn_set.insert(0);
-				for a in v6_set.iter().filter(|a| asn_set.insert(bgp_client.get_asn(IpAddr::V6(**a)))).sample(&mut rng, 10) {
-					if i == &default {
-						dns_buff += &format!("seed\tIN\tAAAA\t{}\n", a);
-					}
-					dns_buff += &format!("x{:x}.seed\tIN\tAAAA\t{}\n", i, a);
-				}
-				for a in tor_set.iter().sample(&mut rng, 2) {
-					if i == &default {
-						dns_buff += &format!("seed\tIN\tAAAA\t{}\n", a);
-					}
-					dns_buff += &format!("x{:x}.seed\tIN\tAAAA\t{}\n", i, a);
-				}
-			}
-		}
-		
-		if let Ok(mut f) = File::create(dns_file.clone() + ".tmp").await {
-			let _ = f.write_all(dns_buff.as_bytes()).await;
-			let _ = f.sync_all().await;
-			let _ = tokio::fs::rename(dns_file.clone() + ".tmp", &dns_file).await;
-		}
-	}
+        let nodes_file = self.store.clone() + "/nodes";
+        let mut nodes_buff = String::new();
+        {
+            let nodes = self.nodes.read().unwrap();
+            nodes_buff.reserve(nodes.nodes_to_state.len() * 32);
+            for (ref sockaddr, ref node) in nodes.nodes_to_state.iter() {
+                nodes_buff += &sockaddr.to_string();
+                nodes_buff += ",";
+                nodes_buff += &node.state.to_num().to_string();
+                nodes_buff += ",";
+                nodes_buff += &node.last_services().to_string();
+                nodes_buff += "\n";
+            }
+        }
 
-	pub fn get_next_scan_nodes(&self) -> Vec<SocketAddr> {
-		let mut res = Vec::with_capacity(128);
+        if let Ok(mut f) = File::create(nodes_file.clone() + ".tmp").await {
+            let _ = f.write_all(nodes_buff.as_bytes()).await;
+            let _ = f.sync_all().await;
+            let _ = tokio::fs::rename(nodes_file.clone() + ".tmp", &nodes_file).await;
+        }
+    }
 
-		{
-			let mut nodes_lock = self.nodes.write().unwrap();
-			let nodes = nodes_lock.borrow_mut();
-			for (idx, state_nodes) in nodes.state_next_scan.iter_mut().enumerate() {
-				let rescan_interval = cmp::max(self.get_u64(U64Setting::RescanInterval(AddressState::from_num(idx as u8).unwrap())), 1);
-				let split_point = cmp::min(cmp::min(SECS_PER_SCAN_RESULTS * state_nodes.len() as u64 / rescan_interval,
-							SECS_PER_SCAN_RESULTS * MAX_CONNS_PER_SEC_PER_STATUS),
-						state_nodes.len() as u64);
-				for node in state_nodes.drain(..split_point as usize) {
-					nodes.nodes_to_state.get_mut(&node).unwrap().queued = false;
-					res.push((&node).into());
-				}
-			}
-		}
-		res.shuffle(&mut rng());
-		res
-	}
+    pub async fn write_dns(&'static self, bgp_client: Arc<BGPClient>) {
+        let dns_file = self.store.clone() + "/nodes.dump";
+        let mut dns_buff = String::new();
+        {
+            let mut rng = rng();
+            for i in &[
+                0b00000000001u64,
+                0b00000000100,
+                0b00000000101,
+                0b00000001000,
+                0b00000001001,
+                0b00000001100,
+                0b00000001101,
+                0b00001001001,
+                0b10000000000,
+                0b10000000001,
+                0b10000000100,
+                0b10000000101,
+                0b10000001000,
+                0b10000001001,
+                0b10000001100,
+                0b10000001101,
+                0b10001001000,
+            ] {
+                //            ^ NODE_NETWORK_LIIMTED
+                //COMPACT_FILTERS ^   ^ NODE_BLOOM
+                //      NODE_WITNESS ^  ^ NODE_NETWORK
+                // We support all combos of NETWORK, NETWORK_LIMITED, BLOOM, and WITNESS
+                // We support COMPACT_FILTERS with WITNESS and NETWORK or NETWORK_LIIMTED.
+                let mut tor_set: Vec<Ipv6Addr> = Vec::new();
+                let mut v6_set: Vec<Ipv6Addr> = Vec::new();
+                let mut v4_set: Vec<Ipv4Addr> = Vec::new();
+                macro_rules! add_addr {
+                    ($addr: expr) => {
+                        match $addr.ip() {
+                            IpAddr::V4(v4addr) => v4_set.push(v4addr),
+                            IpAddr::V6(v6addr)
+                                if v6addr.octets()[..6]
+                                    == [0xFD, 0x87, 0xD8, 0x7E, 0xEB, 0x43][..] =>
+                            {
+                                tor_set.push(v6addr)
+                            }
+                            IpAddr::V6(v6addr) => v6_set.push(v6addr),
+                        }
+                    };
+                }
+                {
+                    let nodes = self.nodes.read().unwrap();
+                    if i.count_ones() == 1 {
+                        for j in 0..64 {
+                            if i & (1 << j) != 0 {
+                                let set_ref = &nodes.good_node_services[j];
+                                for a in set_ref.iter().filter(|e| e.port() == 8333) {
+                                    add_addr!(a);
+                                }
+                                break;
+                            }
+                        }
+                    } else if i.count_ones() == 2 {
+                        let mut first_set = None;
+                        let mut second_set = None;
+                        for j in 0..64 {
+                            if i & (1 << j) != 0 {
+                                if first_set == None {
+                                    first_set = Some(&nodes.good_node_services[j]);
+                                } else {
+                                    second_set = Some(&nodes.good_node_services[j]);
+                                    break;
+                                }
+                            }
+                        }
+                        for a in first_set
+                            .unwrap()
+                            .intersection(&second_set.unwrap())
+                            .filter(|e| e.port() == 8333)
+                        {
+                            add_addr!(a);
+                        }
+                    } else {
+                        //TODO: Could optimize this one a bit
+                        let mut intersection;
+                        let mut intersection_set_ref = None;
+                        for j in 0..64 {
+                            if i & (1 << j) != 0 {
+                                if intersection_set_ref == None {
+                                    intersection_set_ref = Some(&nodes.good_node_services[j]);
+                                } else {
+                                    let new_intersection = intersection_set_ref
+                                        .unwrap()
+                                        .intersection(&nodes.good_node_services[j])
+                                        .map(|e| (*e).clone())
+                                        .collect();
+                                    intersection = Some(new_intersection);
+                                    intersection_set_ref = Some(intersection.as_ref().unwrap());
+                                }
+                            }
+                        }
+                        for a in intersection_set_ref
+                            .unwrap()
+                            .iter()
+                            .filter(|e| e.port() == 8333)
+                        {
+                            add_addr!(a);
+                        }
+                    }
+                }
+                let mut asn_set = HashSet::with_capacity(cmp::max(v4_set.len(), v6_set.len()));
+                asn_set.insert(0);
+                let default = 1u64;
+                for a in v4_set
+                    .iter()
+                    .filter(|a| asn_set.insert(bgp_client.get_asn(IpAddr::V4(**a))))
+                    .sample(&mut rng, 21)
+                {
+                    if i == &default {
+                        dns_buff += &format!("seed\tIN\tA\t{}\n", a);
+                    }
+                    dns_buff += &format!("x{:x}.seed\tIN\tA\t{}\n", i, a);
+                }
+                asn_set.clear();
+                asn_set.insert(0);
+                for a in v6_set
+                    .iter()
+                    .filter(|a| asn_set.insert(bgp_client.get_asn(IpAddr::V6(**a))))
+                    .sample(&mut rng, 10)
+                {
+                    if i == &default {
+                        dns_buff += &format!("seed\tIN\tAAAA\t{}\n", a);
+                    }
+                    dns_buff += &format!("x{:x}.seed\tIN\tAAAA\t{}\n", i, a);
+                }
+                for a in tor_set.iter().sample(&mut rng, 2) {
+                    if i == &default {
+                        dns_buff += &format!("seed\tIN\tAAAA\t{}\n", a);
+                    }
+                    dns_buff += &format!("x{:x}.seed\tIN\tAAAA\t{}\n", i, a);
+                }
+            }
+        }
+
+        if let Ok(mut f) = File::create(dns_file.clone() + ".tmp").await {
+            let _ = f.write_all(dns_buff.as_bytes()).await;
+            let _ = f.sync_all().await;
+            let _ = tokio::fs::rename(dns_file.clone() + ".tmp", &dns_file).await;
+        }
+    }
+
+    pub fn get_next_scan_nodes(&self) -> Vec<SocketAddr> {
+        let mut res = Vec::with_capacity(128);
+
+        {
+            let mut nodes_lock = self.nodes.write().unwrap();
+            let nodes = nodes_lock.borrow_mut();
+            for (idx, state_nodes) in nodes.state_next_scan.iter_mut().enumerate() {
+                let rescan_interval = cmp::max(
+                    self.get_u64(U64Setting::RescanInterval(
+                        AddressState::from_num(idx as u8).unwrap(),
+                    )),
+                    1,
+                );
+                let split_point = cmp::min(
+                    cmp::min(
+                        SECS_PER_SCAN_RESULTS * state_nodes.len() as u64 / rescan_interval,
+                        SECS_PER_SCAN_RESULTS * MAX_CONNS_PER_SEC_PER_STATUS,
+                    ),
+                    state_nodes.len() as u64,
+                );
+                for node in state_nodes.drain(..split_point as usize) {
+                    nodes.nodes_to_state.get_mut(&node).unwrap().queued = false;
+                    res.push((&node).into());
+                }
+            }
+        }
+        res.shuffle(&mut rng());
+        res
+    }
 }
