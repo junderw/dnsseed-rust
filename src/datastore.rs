@@ -21,7 +21,7 @@ use crate::bloom::RollingBloomFilter;
 use crate::bgp_client::BGPClient;
 
 pub const SECS_PER_SCAN_RESULTS: u64 = 15;
-const MAX_CONNS_PER_SEC_PER_STATUS: u64 = 1000;
+const MAX_CONNS_PER_SEC_PER_STATUS: u64 = 2500;
 
 #[derive(Clone, Copy, Hash, PartialEq, Eq)]
 pub enum AddressState {
@@ -204,13 +204,11 @@ impl SockAddr {
 struct Nodes {
 	good_node_services: [HashSet<SockAddr>; 64],
 	nodes_to_state: HashMap<SockAddr, Node>,
-	timeout_nodes: RollingBloomFilter<SockAddr>,
 	state_next_scan: [Vec<SockAddr>; AddressState::get_count() as usize],
 }
 struct NodesMutRef<'a> {
 	good_node_services: &'a mut [HashSet<SockAddr>; 64],
 	nodes_to_state: &'a mut HashMap<SockAddr, Node>,
-	timeout_nodes: &'a mut RollingBloomFilter<SockAddr>,
 	state_next_scan: &'a mut [Vec<SockAddr>; AddressState::get_count() as usize],
 }
 
@@ -219,7 +217,6 @@ impl Nodes {
 		NodesMutRef {
 			good_node_services: &mut self.good_node_services,
 			nodes_to_state: &mut self.nodes_to_state,
-			timeout_nodes: &mut self.timeout_nodes,
 			state_next_scan: &mut self.state_next_scan,
 		}
 	}
@@ -229,6 +226,7 @@ pub struct Store {
 	u64_settings: RwLock<HashMap<U64Setting, u64>>,
 	subver_regex: RwLock<Arc<Regex>>,
 	nodes: RwLock<Nodes>,
+	timeout_nodes: RollingBloomFilter<SockAddr>,
 	start_time: Instant,
 	store: String,
 }
@@ -301,7 +299,6 @@ impl Store {
 				Nodes {
 					good_node_services,
 					nodes_to_state: HashMap::new(),
-					timeout_nodes: RollingBloomFilter::new(),
 					state_next_scan: state_vecs,
 				}
 			} }
@@ -358,6 +355,7 @@ impl Store {
 				u64_settings: RwLock::new(u64_settings),
 				subver_regex: RwLock::new(Arc::new(regex)),
 				nodes: RwLock::new(nodes),
+				timeout_nodes: RollingBloomFilter::new(),
 				store,
 				start_time: Instant::now(),
 			})
@@ -376,7 +374,7 @@ impl Store {
 		self.nodes.read().unwrap().state_next_scan[state.to_num() as usize].len()
 	}
 	pub fn get_bloom_node_count(&self) -> [usize; crate::bloom::GENERATION_COUNT] {
-		self.nodes.read().unwrap().timeout_nodes.get_element_count()
+		self.timeout_nodes.get_element_count()
 	}
 
 	pub fn get_regex(&self, _setting: RegexSetting) -> Arc<Regex> {
@@ -429,6 +427,10 @@ impl Store {
 	pub fn set_node_state(&self, sockaddr: SocketAddr, state: AddressState, services: u64) -> AddressState {
 		let addr: SockAddr = sockaddr.into();
 
+		if state == AddressState::Untested && self.timeout_nodes.contains(&addr) {
+			return AddressState::Timeout;
+		}
+
 		let now = (Instant::now() - self.start_time).as_secs().try_into().unwrap();
 
 		let mut nodes_lock = self.nodes.write().unwrap();
@@ -441,15 +443,12 @@ impl Store {
 					   entry.get().last_services() == 0 &&
 					   state == AddressState::Timeout => {
 				entry.remove_entry();
-				nodes.timeout_nodes.insert(&addr, Duration::from_secs(self.get_u64(U64Setting::RescanInterval(AddressState::Timeout))));
+				self.timeout_nodes.insert(&addr, Duration::from_secs(self.get_u64(U64Setting::RescanInterval(AddressState::Timeout))));
 				return AddressState::Untested;
 			},
 			hash_map::Entry::Vacant(_) if state == AddressState::Timeout => {
-				nodes.timeout_nodes.insert(&addr, Duration::from_secs(self.get_u64(U64Setting::RescanInterval(AddressState::Timeout))));
+				self.timeout_nodes.insert(&addr, Duration::from_secs(self.get_u64(U64Setting::RescanInterval(AddressState::Timeout))));
 				return AddressState::Untested;
-			},
-			hash_map::Entry::Vacant(_) if nodes.timeout_nodes.contains(&addr) => {
-				return AddressState::Timeout;
 			},
 			_ => {},
 		}
