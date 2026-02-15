@@ -9,6 +9,7 @@ mod timeout_stream;
 mod datastore;
 
 use std::env;
+use std::fs::File;
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
 use std::sync::atomic::{Ordering, AtomicBool};
@@ -34,7 +35,7 @@ use tokio::prelude::*;
 use tokio::timer::Delay;
 
 use tracing::info;
-use tracing_subscriber::EnvFilter;
+use tracing_subscriber::{fmt, EnvFilter, prelude::*};
 
 static mut REQUEST_BLOCK: Option<Box<Mutex<Arc<(u64, BlockHash, Block)>>>> = None;
 static mut HIGHEST_HEADER: Option<Box<Mutex<(BlockHash, u64)>>> = None;
@@ -463,14 +464,25 @@ fn parse_bgp_identifier(s: &str) -> Result<u32, String> {
 fn main() {
 	// Initialize tracing subscriber with env filter
 	// Use RUST_LOG env var to control log levels, e.g. RUST_LOG=debug or RUST_LOG=dnsseed_rust::bgp_client=trace
-	// Note: tracing-subscriber's fmt layer automatically captures `log` crate events
+	// Use RUST_LOG_FILE env var to write logs to a file (e.g. RUST_LOG_FILE=/tmp/dnsseed.log)
 	let filter = EnvFilter::try_from_default_env()
 		.unwrap_or_else(|_| EnvFilter::new("info"));
-	tracing_subscriber::fmt()
-		.with_env_filter(filter)
-		.with_target(true)
-		.with_thread_ids(true)
+
+	let log_file_path = env::var("RUST_LOG_FILE").unwrap_or_else(|_| format!("dnsseed-{}.log", std::process::id()));
+	// Write to file (wrapped in Mutex for thread-safety)
+	let file = File::create(&log_file_path)
+		.expect(&format!("Failed to create log file: {}", log_file_path));
+	tracing_subscriber::registry()
+		.with(
+			fmt::layer()
+				.with_writer(Mutex::new(file))
+				.with_ansi(false)
+				.with_target(true)
+				.with_thread_ids(true)
+		)
+		.with(filter)
 		.init();
+	eprintln!("Logging to file: {}", log_file_path);
 
 	info!("Starting dnsseed-rust");
 
