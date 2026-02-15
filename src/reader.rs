@@ -1,11 +1,9 @@
 use std::sync::Arc;
 use std::sync::atomic::Ordering;
-use std::io::BufReader;
 use std::net::{IpAddr, Ipv6Addr, SocketAddr};
-use std::time::Instant;
 
-use tokio::prelude::*;
-use tokio::io::{stdin, lines};
+use tokio::io::{stdin, AsyncBufReadExt, BufReader};
+use tokio::time::Instant;
 
 use crate::printer::Printer;
 use crate::datastore::{Store, AddressState, U64Setting, RegexSetting};
@@ -66,79 +64,82 @@ fn test_decode_base32() {
 }
 
 pub fn read(store: &'static Store, printer: &'static Printer, bgp_client: Arc<BGPClient>) {
-	tokio::spawn(lines(BufReader::new(stdin())).for_each(move |line| {
-		macro_rules! err {
-			() => { {
-				printer.add_line(format!("Unparsable input: \"{}\"", line), true);
-				return future::ok(());
-			} }
-		}
-		let mut line_iter = line.split(' ');
-		macro_rules! get_next_chunk {
-			() => { {
-				match line_iter.next() {
-					Some(c) => c,
-					None => err!(),
-				}
-			} }
-		}
-		macro_rules! try_parse_next_chunk {
-			($type: ty) => { {
-				match get_next_chunk!().parse::<$type>() {
-					Ok(res) => res,
-					Err(_) => err!(),
-				}
-			} }
-		}
-		match get_next_chunk!() {
-			"t" => store.set_u64(U64Setting::RunTimeout, try_parse_next_chunk!(u64)),
-			"v" => store.set_u64(U64Setting::MinProtocolVersion, try_parse_next_chunk!(u64)),
-			"w" => store.set_u64(U64Setting::WasGoodTimeout, try_parse_next_chunk!(u64)),
-			"s" => {
-				if line.len() < 3 || !line.starts_with("s ") {
-					err!();
-				}
-				store.set_regex(RegexSetting::SubverRegex, match line[2..].parse::<Regex>() {
-					Ok(res) => res,
-					Err(_) => err!(),
-				});
-			},
-			"a" => {
-				let host_port = get_next_chunk!();
-				let parsed = if host_port.len() > 23 && &host_port[16..23] == ".onion:" {
-					let port = match host_port[23..].parse::<u16>() { Ok(res) => res, Err(_) => err!(), };
+	tokio::spawn(async move {
+		let reader = BufReader::new(stdin());
+		let mut lines = reader.lines();
+		
+		while let Ok(Some(line)) = lines.next_line().await {
+			macro_rules! err {
+				() => { {
+					printer.add_line(format!("Unparsable input: \"{}\"", line), true);
+					continue;
+				} }
+			}
+			let mut line_iter = line.split(' ');
+			macro_rules! get_next_chunk {
+				() => { {
+					match line_iter.next() {
+						Some(c) => c,
+						None => err!(),
+					}
+				} }
+			}
+			macro_rules! try_parse_next_chunk {
+				($type: ty) => { {
+					match get_next_chunk!().parse::<$type>() {
+						Ok(res) => res,
+						Err(_) => err!(),
+					}
+				} }
+			}
+			match get_next_chunk!() {
+				"t" => store.set_u64(U64Setting::RunTimeout, try_parse_next_chunk!(u64)),
+				"v" => store.set_u64(U64Setting::MinProtocolVersion, try_parse_next_chunk!(u64)),
+				"w" => store.set_u64(U64Setting::WasGoodTimeout, try_parse_next_chunk!(u64)),
+				"s" => {
+					if line.len() < 3 || !line.starts_with("s ") {
+						err!();
+					}
+					store.set_regex(RegexSetting::SubverRegex, match line[2..].parse::<Regex>() {
+						Ok(res) => res,
+						Err(_) => err!(),
+					});
+				},
+				"a" => {
+					let host_port = get_next_chunk!();
+					let parsed = if host_port.len() > 23 && &host_port[16..23] == ".onion:" {
+						let port = match host_port[23..].parse::<u16>() { Ok(res) => res, Err(_) => err!(), };
 
-					let ipv6 = match decode_base32(host_port[0..16].as_bytes()) { Some(res) => res, None => err!(), };
-					if ipv6.len() != 10 { err!(); }
-					let mut octets = [0xFD,0x87,0xD8,0x7E,0xEB,0x43, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0];
-					octets[6..].copy_from_slice(&ipv6[0..10]);
+						let ipv6 = match decode_base32(host_port[0..16].as_bytes()) { Some(res) => res, None => err!(), };
+						if ipv6.len() != 10 { err!(); }
+						let mut octets = [0xFD,0x87,0xD8,0x7E,0xEB,0x43, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0];
+						octets[6..].copy_from_slice(&ipv6[0..10]);
 
-					SocketAddr::new(IpAddr::V6(Ipv6Addr::from(octets)), port)
-				} else {
-					match host_port.parse::<SocketAddr>() {
-						Ok(res) => res, Err(_) => err!(), }
-				};
-				scan_node(Instant::now(), parsed, true)
-			},
-			"b" => {
-				let ip = try_parse_next_chunk!(IpAddr);
-				printer.add_line(format!("ASN for {} is {} (prefixlen, path: {:?})", ip, bgp_client.get_asn(ip), bgp_client.get_path(ip)), false);
-			},
-			"r" => {
-				match AddressState::from_num(try_parse_next_chunk!(u8)) {
-					Some(state) => store.set_u64(U64Setting::RescanInterval(state), try_parse_next_chunk!(u64)),
-					None => err!(),
-				}
-			},
-			"q" => {
-				START_SHUTDOWN.store(true, Ordering::SeqCst);
-				return future::err(std::io::Error::new(std::io::ErrorKind::Other, ""));
-			},
-			_ => err!(),
+						SocketAddr::new(IpAddr::V6(Ipv6Addr::from(octets)), port)
+					} else {
+						match host_port.parse::<SocketAddr>() {
+							Ok(res) => res, Err(_) => err!(), }
+					};
+					scan_node(Instant::now(), parsed, true)
+				},
+				"b" => {
+					let ip = try_parse_next_chunk!(IpAddr);
+					printer.add_line(format!("ASN for {} is {} (prefixlen, path: {:?})", ip, bgp_client.get_asn(ip), bgp_client.get_path(ip)), false);
+				},
+				"r" => {
+					match AddressState::from_num(try_parse_next_chunk!(u8)) {
+						Some(state) => store.set_u64(U64Setting::RescanInterval(state), try_parse_next_chunk!(u64)),
+						None => err!(),
+					}
+				},
+				"q" => {
+					START_SHUTDOWN.store(true, Ordering::SeqCst);
+					break;
+				},
+				_ => err!(),
+			}
 		}
-		future::ok(())
-	}).then(move |_| {
+		
 		printer.add_line("Shutting down...".to_string(), true);
-		future::ok(())
-	}));
+	});
 }

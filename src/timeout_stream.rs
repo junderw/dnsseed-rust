@@ -1,56 +1,65 @@
-use tokio::prelude::*;
-use tokio::timer::Delay;
+use std::pin::Pin;
+use std::task::{Context, Poll};
+use std::time::Duration;
 
-use std::time::{Duration, Instant};
+use futures::{Future, Stream};
+use pin_project_lite::pin_project;
+use tokio::time::{Sleep, Instant, sleep_until};
 
-pub struct TimeoutStream<S> where S : Stream {
-	stream: S,
-	next_deadline: Delay,
-	extend_on_recv: bool,
-	timeout: Duration,
+pin_project! {
+	pub struct TimeoutStream<S> {
+		#[pin]
+		stream: S,
+		#[pin]
+		sleep: Sleep,
+		extend_on_recv: bool,
+		timeout: Duration,
+	}
 }
 
-impl<S> TimeoutStream<S> where S : Stream {
+impl<S> TimeoutStream<S> where S: Stream {
 	pub fn new_persistent(stream: S, timeout: Duration) -> Self {
-		let next_deadline = Delay::new(Instant::now() + timeout);
+		let sleep = sleep_until(Instant::now() + timeout);
 		Self {
 			stream,
-			next_deadline,
+			sleep,
 			extend_on_recv: true,
 			timeout,
 		}
 	}
 
 	pub fn new_timeout(stream: S, timeout: Instant) -> Self {
-		let next_deadline = Delay::new(timeout);
+		let sleep = sleep_until(timeout);
 		Self {
 			stream,
-			next_deadline,
+			sleep,
 			extend_on_recv: false,
 			timeout: Duration::from_secs(0),
 		}
 	}
 }
 
-impl<S> Stream for TimeoutStream<S> where S : Stream {
-	type Item = S::Item;
-	type Error = S::Error;
-	fn poll(&mut self) -> Result<Async<Option<S::Item>>, S::Error> {
-		match self.next_deadline.poll() {
-			Ok(Async::Ready(_)) => Ok(Async::Ready(None)),
-			Ok(Async::NotReady) => {
-				match self.stream.poll() {
-					Ok(Async::Ready(v)) => {
-						if self.extend_on_recv {
-							self.next_deadline.reset(Instant::now() + self.timeout);
-						}
-						Ok(Async::Ready(v))
-					},
-					Ok(Async::NotReady) => Ok(Async::NotReady),
-					Err(e) => Err(e),
+impl<S, T> Stream for TimeoutStream<S> where S: Stream<Item = T> {
+	type Item = T;
+	
+	fn poll_next(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Option<Self::Item>> {
+		let mut this = self.project();
+		
+		// Check if timeout elapsed
+		if this.sleep.as_mut().poll(cx).is_ready() {
+			return Poll::Ready(None);
+		}
+		
+		// Poll the underlying stream
+		match this.stream.poll_next(cx) {
+			Poll::Ready(Some(v)) => {
+				if *this.extend_on_recv {
+					this.sleep.as_mut().reset(Instant::now() + *this.timeout);
 				}
+				Poll::Ready(Some(v))
 			},
-			Err(_) => Ok(Async::Ready(None)), // TODO: If I want to upstream TimeoutStream this is gonna need some love
+			Poll::Ready(None) => Poll::Ready(None),
+			Poll::Pending => Poll::Pending,
 		}
 	}
 }

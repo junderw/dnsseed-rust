@@ -3,7 +3,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::cmp;
 use std::collections::{HashMap, hash_map};
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
-use std::time::{Duration, Instant};
+use std::time::Duration;
 
 use bgp_rs::{AFI, SAFI, AddPathDirection, Open, OpenCapability, OpenParameter, NLRIEncoding, PathAttribute};
 use bgp_rs::Capabilities;
@@ -11,13 +11,15 @@ use bgp_rs::Segment;
 use bgp_rs::Message;
 use bgp_rs::Reader;
 
-use tokio::prelude::*;
-use tokio::codec;
-use tokio::codec::Framed;
+use bytes::Buf;
 use tokio::net::TcpStream;
-use tokio::timer::Delay;
+use tokio::time::sleep;
+use tokio::sync::mpsc;
+use tokio_util::codec::{Decoder, Encoder, Framed};
 
-use futures::sync::mpsc;
+use futures::{SinkExt, StreamExt};
+
+use tracing::{debug, info, warn, error, trace};
 
 use crate::printer::{Printer, Stat};
 use crate::timeout_stream::TimeoutStream;
@@ -226,7 +228,7 @@ impl<'a> std::io::Read for BytesDecoder<'a> {
 }
 
 struct MsgCoder(Option<Capabilities>);
-impl codec::Decoder for MsgCoder {
+impl Decoder for MsgCoder {
 	type Item = Message;
 	type Error = std::io::Error;
 
@@ -243,23 +245,35 @@ impl codec::Decoder for MsgCoder {
 		match reader.read() {
 			Ok((_header, msg)) => {
 				decoder.buf.advance(decoder.pos);
+				trace!(msg_type = ?std::mem::discriminant(&msg), "Decoded BGP message");
 				if let Message::Open(ref o) = &msg {
+					debug!(
+						version = o.version,
+						peer_asn = o.peer_asn,
+						hold_timer = o.hold_timer,
+						identifier = format_args!("0x{:08x}", o.identifier),
+						params_count = o.parameters.len(),
+						"Received BGP OPEN message"
+					);
 					self.0 = Some(Capabilities::from_parameters(o.parameters.clone()));
 				}
 				Ok(Some(msg))
 			},
 			Err(e) => match e.kind() {
 				std::io::ErrorKind::UnexpectedEof => Ok(None),
-				_ => Err(e),
+				_ => {
+					error!(error = %e, "BGP message decode error");
+					Err(e)
+				},
 			},
 		}
 	}
 }
-impl codec::Encoder for MsgCoder {
-	type Item = Message;
+impl Encoder<Message> for MsgCoder {
 	type Error = std::io::Error;
 
 	fn encode(&mut self, msg: Message, res: &mut bytes::BytesMut) -> Result<(), std::io::Error> {
+		trace!(msg_type = ?std::mem::discriminant(&msg), "Encoding BGP message");
 		msg.encode(&mut BytesCoder(res))?;
 		Ok(())
 	}
@@ -380,91 +394,182 @@ impl BGPClient {
 		} else { None }
 	}
 
-	fn connect_given_client(addr: SocketAddr, timeout: Duration, printer: &'static Printer, client: Arc<BGPClient>) {
-		tokio::spawn(Delay::new(Instant::now() + timeout / 4).then(move |_| {
-			let connect_timeout = Delay::new(Instant::now() + timeout.clone()).then(|_| {
-				future::err(std::io::Error::new(std::io::ErrorKind::TimedOut, "timeout reached"))
-			});
-			let client_reconn = Arc::clone(&client);
-			TcpStream::connect(&addr).select(connect_timeout)
-				.or_else(move |_| {
-					Delay::new(Instant::now() + timeout / 2).then(|_| {
-						future::err(())
-					})
-				}).and_then(move |stream| {
-					let (write, read) = Framed::new(stream.0, MsgCoder(None)).split();
-					let (mut sender, receiver) = mpsc::channel(10); // We never really should send more than 10 messages unless they're dumb
-					tokio::spawn(write.sink_map_err(|_| { () }).send_all(receiver)
-						.then(|_| {
-							future::err(())
-						}));
-					let _ = sender.try_send(Message::Open(Open {
-						version: 4,
-						peer_asn: 54415,
-						hold_timer: timeout.as_secs() as u16,
-						identifier: 0x6763aa29, // 103.99.170.41
-						parameters: vec![OpenParameter::Capabilities(vec![
-							OpenCapability::MultiProtocol((AFI::IPV4, SAFI::Unicast)),
-							OpenCapability::MultiProtocol((AFI::IPV6, SAFI::Unicast)),
-							OpenCapability::FourByteASN(54415),
-							OpenCapability::RouteRefresh,
-							OpenCapability::AddPath(vec![
-								(AFI::IPV4, SAFI::Unicast, AddPathDirection::ReceivePaths),
-								(AFI::IPV6, SAFI::Unicast, AddPathDirection::ReceivePaths)]),
-						])],
-					}));
-					TimeoutStream::new_persistent(read, timeout).for_each(move |bgp_msg| {
-						if client.shutdown.load(Ordering::Relaxed) {
-							return future::err(std::io::Error::new(std::io::ErrorKind::Other, "Shutting Down"));
-						}
-						match bgp_msg {
-							Message::Open(_) => {
-								client.routes.lock().unwrap().v4_table.clear();
-								client.routes.lock().unwrap().v6_table.clear();
-								printer.add_line("Connected to BGP route provider".to_string(), false);
-							},
-							Message::KeepAlive => {
-								let _ = sender.try_send(Message::KeepAlive);
-							},
-							Message::Update(mut upd) => {
-								let _ = sender.try_send(Message::KeepAlive);
-								upd.normalize();
-								let mut route_table = client.routes.lock().unwrap();
-								for r in upd.withdrawn_routes {
-									route_table.withdraw(r);
-								}
-								if let Some(path) = Self::map_attrs(upd.attributes) {
-									for r in upd.announced_routes {
-										route_table.announce(r, path.clone());
-									}
-								}
-								printer.set_stat(Stat::V4RoutingTableSize(route_table.v4_table.len()));
-								printer.set_stat(Stat::V6RoutingTableSize(route_table.v6_table.len()));
-								printer.set_stat(Stat::RoutingTablePaths(route_table.max_paths));
-							},
-							_ => {}
-						}
-						future::ok(())
-					}).or_else(move |e| {
-						printer.add_line(format!("Got error from BGP stream: {:?}", e), true);
-						future::ok(())
-					})
-				}).then(move |_| {
-					if !client_reconn.shutdown.load(Ordering::Relaxed) {
-						BGPClient::connect_given_client(addr, timeout, printer, client_reconn);
-					}
-					future::ok(())
-				})
-			})
+	fn connect_given_client(remote_asn: u32, addr: SocketAddr, timeout: Duration, printer: &'static Printer, client: Arc<BGPClient>, identifier: u32) {
+		info!(
+			peer = %addr,
+			remote_asn = remote_asn,
+			identifier = format_args!("0x{:08x}", identifier),
+			timeout_secs = timeout.as_secs(),
+			"Initiating BGP connection"
 		);
+		tokio::spawn(async move {
+			// Initial delay before connecting
+			sleep(timeout / 4).await;
+			debug!(peer = %addr, "Connection delay elapsed, attempting TCP connect");
+			
+			loop {
+				// Try to connect with timeout
+				let stream = match tokio::time::timeout(timeout, TcpStream::connect(addr)).await {
+					Ok(Ok(stream)) => stream,
+					Ok(Err(e)) => {
+						warn!(peer = %addr, error = ?e, "BGP TCP connection failed, will retry");
+						sleep(timeout / 2).await;
+						if client.shutdown.load(Ordering::Relaxed) {
+							info!(peer = %addr, "BGP shutdown requested, not reconnecting");
+							return;
+						}
+						continue;
+					},
+					Err(_) => {
+						warn!("BGP connection timeout reached");
+						sleep(timeout / 2).await;
+						if client.shutdown.load(Ordering::Relaxed) {
+							info!(peer = %addr, "BGP shutdown requested, not reconnecting");
+							return;
+						}
+						continue;
+					}
+				};
+				
+				info!(peer = %addr, "BGP TCP connection established");
+				let (mut write, read) = Framed::new(stream, MsgCoder(None)).split();
+				let (sender, mut receiver) = mpsc::channel::<Message>(10);
+				
+				// Spawn write task
+				tokio::spawn(async move {
+					while let Some(msg) = receiver.recv().await {
+						if write.send(msg).await.is_err() {
+							error!("BGP write stream error");
+							break;
+						}
+					}
+					debug!("BGP write stream closed");
+				});
+				
+				let peer_asn = if remote_asn > u16::max_value() as u32 { 23456 } else { remote_asn as u16 };
+				debug!(
+					peer = %addr,
+					version = 4,
+					peer_asn = peer_asn,
+					actual_asn = remote_asn,
+					hold_timer = timeout.as_secs(),
+					identifier = format_args!("0x{:08x}", identifier),
+					"Sending BGP OPEN message"
+				);
+				let _ = sender.send(Message::Open(Open {
+					version: 4,
+					peer_asn,
+					hold_timer: timeout.as_secs() as u16,
+					identifier,
+					parameters: vec![OpenParameter::Capabilities(vec![
+						OpenCapability::MultiProtocol((AFI::IPV4, SAFI::Unicast)),
+						OpenCapability::MultiProtocol((AFI::IPV6, SAFI::Unicast)),
+						OpenCapability::FourByteASN(remote_asn),
+						OpenCapability::RouteRefresh,
+						OpenCapability::AddPath(vec![
+							(AFI::IPV4, SAFI::Unicast, AddPathDirection::ReceivePaths),
+							(AFI::IPV6, SAFI::Unicast, AddPathDirection::ReceivePaths)]),
+					])],
+				})).await;
+				
+				// Process messages with timeout
+				let timed_read = TimeoutStream::new_persistent(read, timeout);
+				let mut timed_read = std::pin::pin!(timed_read);
+				while let Some(result) = timed_read.next().await {
+					if client.shutdown.load(Ordering::Relaxed) {
+						info!(peer = %addr, "BGP client shutdown requested");
+						return;
+					}
+					
+					let bgp_msg = match result {
+						Ok(msg) => msg,
+						Err(e) => {
+							error!(peer = %addr, error = ?e, "BGP stream error");
+							printer.add_line(format!("Got error from BGP stream: {:?}", e), true);
+							break;
+						}
+					};
+					
+					match bgp_msg {
+						Message::Open(ref open) => {
+							info!(
+								peer = %addr,
+								remote_identifier = format_args!("0x{:08x}", open.identifier),
+								remote_hold_timer = open.hold_timer,
+								remote_version = open.version,
+								"Received BGP OPEN, session established"
+							);
+							client.routes.lock().unwrap().v4_table.clear();
+							client.routes.lock().unwrap().v6_table.clear();
+							printer.add_line("Connected to BGP route provider".to_string(), false);
+						},
+						Message::KeepAlive => {
+							trace!(peer = %addr, "Received BGP KEEPALIVE, sending response");
+							let _ = sender.send(Message::KeepAlive).await;
+						},
+						Message::Update(mut upd) => {
+							trace!(
+								peer = %addr,
+								withdrawn_count = upd.withdrawn_routes.len(),
+								announced_count = upd.announced_routes.len(),
+								attrs_count = upd.attributes.len(),
+								"Received BGP UPDATE"
+							);
+							let _ = sender.send(Message::KeepAlive).await;
+							upd.normalize();
+							let mut route_table = client.routes.lock().unwrap();
+							for r in upd.withdrawn_routes {
+								trace!(route = ?r, "Withdrawing route");
+								route_table.withdraw(r);
+							}
+							if let Some(path) = Self::map_attrs(upd.attributes) {
+								for r in upd.announced_routes {
+									trace!(route = ?r, path_len = path.path_len, "Announcing route");
+									route_table.announce(r, path.clone());
+								}
+							}
+							printer.set_stat(Stat::V4RoutingTableSize(route_table.v4_table.len()));
+							printer.set_stat(Stat::V6RoutingTableSize(route_table.v6_table.len()));
+							printer.set_stat(Stat::RoutingTablePaths(route_table.max_paths));
+						},
+						Message::Notification(notif) => {
+							error!(
+								peer = %addr,
+								error_code = notif.major_err_code,
+								error_subcode = notif.minor_err_code,
+								data = ?notif.data,
+								"Received BGP NOTIFICATION"
+							);
+						},
+						msg => {
+							debug!(peer = %addr, msg_type = ?std::mem::discriminant(&msg), "Received other BGP message");
+						}
+					}
+				}
+				
+				// Connection closed, check if we should reconnect
+				if client.shutdown.load(Ordering::Relaxed) {
+					info!(peer = %addr, "BGP connection closed, not reconnecting (shutdown)");
+					return;
+				}
+				
+				info!(peer = %addr, "BGP connection closed, scheduling reconnect");
+			}
+		});
 	}
 
-	pub fn new(addr: SocketAddr, timeout: Duration, printer: &'static Printer) -> Arc<BGPClient> {
+	pub fn new(remote_asn: u32, addr: SocketAddr, timeout: Duration, printer: &'static Printer, identifier: u32) -> Arc<BGPClient> {
+		info!(
+			peer = %addr,
+			remote_asn = remote_asn,
+			identifier = format_args!("0x{:08x}", identifier),
+			"Creating new BGP client"
+		);
 		let client = Arc::new(BGPClient {
 			routes: Mutex::new(RoutingTable::new()),
 			shutdown: AtomicBool::new(false),
 		});
-		BGPClient::connect_given_client(addr, timeout, printer, Arc::clone(&client));
+		BGPClient::connect_given_client(remote_asn, addr, timeout, printer, Arc::clone(&client), identifier);
 		client
 	}
 }
