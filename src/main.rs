@@ -1,3 +1,5 @@
+// TODO: Don't use references to static mut globals. It's unsafe.
+#![allow(static_mut_refs)]
 mod bloom;
 mod printer;
 mod reader;
@@ -426,9 +428,41 @@ fn make_trusted_conn(trusted_sockaddr: SocketAddr, bgp_client: Arc<BGPClient>) {
 	}));
 }
 
+fn parse_bgp_identifier(s: &str) -> Result<u32, String> {
+	// Try hex format (0x...)
+	if let Some(hex_str) = s.strip_prefix("0x").or_else(|| s.strip_prefix("0X")) {
+		return u32::from_str_radix(hex_str, 16)
+			.map_err(|e| format!("Invalid hex identifier: {}", e));
+	}
+	// Try IPv4 format (a.b.c.d)
+	if s.contains('.') {
+		let mut octets = [0u8; 4];
+		let mut count = 0;
+		for (i, p) in s.split('.').enumerate() {
+			if i >= 4 {
+				return Err(format!("Invalid IPv4 identifier: {}", s));
+			}
+			match p.parse::<u8>() {
+				Ok(v) => octets[i] = v,
+				Err(_) => return Err(format!("Invalid IPv4 identifier: {}", s)),
+			}
+			count = i + 1;
+		}
+		if count == 4 {
+			return Ok(u32::from_be_bytes(octets));
+		}
+		return Err(format!("Invalid IPv4 identifier: {}", s));
+	}
+	// Try decimal format
+	s.parse::<u32>().map_err(|e| format!("Invalid decimal identifier: {}", e))
+}
+
 fn main() {
-	if env::args().len() != 6 {
-		println!("USAGE: dnsseed-rust datastore localPeerAddress tor_proxy_addr bgp_peer bgp_peer_asn");
+	let argc = env::args().len();
+	if !(6..=7).contains(&argc) {
+		println!("USAGE: dnsseed-rust datastore localPeerAddress tor_proxy_addr bgp_peer bgp_peer_asn [bgp_identifier]");
+		println!("  bgp_identifier can be: decimal (12345), hex (0x453b1215), or IPv4 (69.59.18.21)");
+		println!("  Default bgp_identifier: 0x453b1215 (69.59.18.21)");
 		return;
 	}
 
@@ -439,28 +473,32 @@ fn main() {
 	unsafe { HIGHEST_HEADER = Some(Box::new(Mutex::new((genesis_block(Network::Bitcoin).block_hash(), 0)))) };
 	unsafe { REQUEST_BLOCK = Some(Box::new(Mutex::new(Arc::new((0, genesis_block(Network::Bitcoin).block_hash(), genesis_block(Network::Bitcoin)))))) };
 
+	// Parse arguments before entering async runtime
+	let mut args = env::args();
+	args.next();
+	let path = args.next().unwrap();
+	let trusted_sockaddr: SocketAddr = args.next().unwrap().parse().unwrap();
+	let tor_socks5_sockaddr: SocketAddr = args.next().unwrap().parse().unwrap();
+	unsafe { TOR_PROXY = Some(tor_socks5_sockaddr); }
+	let bgp_sockaddr: SocketAddr = args.next().unwrap().parse().unwrap();
+	let bgp_peerasn: u32 = args.next().unwrap().parse().unwrap();
+	let bgp_identifier: u32 = args.next()
+		.map_or(
+			0x453b1215,
+			|s| parse_bgp_identifier(&s).unwrap_or(0x453b1215),
+		);
+
 	let trt = tokio::runtime::Builder::new()
 		.blocking_threads(2).core_threads(num_cpus::get().max(1) + 1)
 		.build().unwrap();
 
-	let _ = trt.block_on_all(future::lazy(|| {
-		let mut args = env::args();
-		args.next();
-		let path = args.next().unwrap();
-		let trusted_sockaddr: SocketAddr = args.next().unwrap().parse().unwrap();
-
-		let tor_socks5_sockaddr: SocketAddr = args.next().unwrap().parse().unwrap();
-		unsafe { TOR_PROXY = Some(tor_socks5_sockaddr); }
-
-		let bgp_sockaddr: SocketAddr = args.next().unwrap().parse().unwrap();
-		let bgp_peerasn: u32 = args.next().unwrap().parse().unwrap();
-
+	let _ = trt.block_on_all(future::lazy(move || {
 		Store::new(path).and_then(move |store| {
 			unsafe { DATA_STORE = Some(Box::new(store)) };
 			let store = unsafe { DATA_STORE.as_ref().unwrap() };
 			unsafe { PRINTER = Some(Box::new(Printer::new(store))) };
 
-			let bgp_client = BGPClient::new(bgp_peerasn, bgp_sockaddr, Duration::from_secs(60), unsafe { PRINTER.as_ref().unwrap() });
+			let bgp_client = BGPClient::new(bgp_peerasn, bgp_sockaddr, Duration::from_secs(300), unsafe { PRINTER.as_ref().unwrap() }, bgp_identifier);
 			make_trusted_conn(trusted_sockaddr, Arc::clone(&bgp_client));
 
 			reader::read(store, unsafe { PRINTER.as_ref().unwrap() }, bgp_client);
