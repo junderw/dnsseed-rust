@@ -1,5 +1,5 @@
 use std::collections::hash_map::RandomState;
-use std::hash::{BuildHasher, Hash, Hasher};
+use std::hash::{BuildHasher, Hash};
 use std::marker::PhantomData;
 use std::sync::RwLock;
 use std::time::{Duration, Instant};
@@ -32,8 +32,7 @@ pub struct RollingBloomFilter<T: Hash> {
 
 impl<T: Hash> RollingBloomFilter<T> {
     pub fn new() -> Self {
-        let mut bits = Vec::new();
-        bits.resize(FILTER_SIZE * GENERATION_BITS / 64, 0);
+        let bits = vec![0; FILTER_SIZE * GENERATION_BITS / 64];
         Self {
             state: RwLock::new(FilterState {
                 last_roll: Instant::now(),
@@ -66,16 +65,15 @@ impl<T: Hash> RollingBloomFilter<T> {
         }
     }
 
+    #[allow(clippy::similar_names, clippy::cast_possible_truncation)]
     pub fn contains(&self, item: &T) -> bool {
         let mut hashes = [None; HASHES];
         for (idx, state) in self.hash_keys.iter().enumerate() {
-            let mut hasher = state.build_hasher();
-            item.hash(&mut hasher);
-            hashes[idx] = Some(hasher.finish() as usize);
+            hashes[idx] = Some(state.hash_one(item) as usize);
         }
 
         let state = self.state.read().unwrap();
-        for idx_opt in hashes.iter() {
+        for idx_opt in &hashes {
             let idx = idx_opt.unwrap();
 
             let byte = state.bits[(idx / ELEMENTS_PER_VAR) % (FILTER_SIZE / 64)];
@@ -96,16 +94,15 @@ impl<T: Hash> RollingBloomFilter<T> {
         res
     }
 
+    #[allow(clippy::similar_names, clippy::cast_possible_truncation)]
     pub fn insert(&self, item: &T, roll_duration: Duration) {
         let mut hashes = [None; HASHES];
         for (idx, state) in self.hash_keys.iter().enumerate() {
-            let mut hasher = state.build_hasher();
-            item.hash(&mut hasher);
-            hashes[idx] = Some(hasher.finish() as usize);
+            hashes[idx] = Some(state.hash_one(item) as usize);
         }
 
         let mut state = self.state.write().unwrap();
-        if Instant::now() - state.last_roll > roll_duration / GENERATION_COUNT as u32
+        if state.last_roll.elapsed() > roll_duration / GENERATION_COUNT as u32
             || state.inserted_since_last_roll > ROLL_COUNT
         {
             state.current_generation += 1;
@@ -120,7 +117,7 @@ impl<T: Hash> RollingBloomFilter<T> {
                     let bits_shift = i * GENERATION_BITS;
                     let bits = (var & ((GENERATION_COUNT as u64) << bits_shift)) >> bits_shift;
 
-                    if bits == remove_generation as u64 {
+                    if bits == u64::from(remove_generation) {
                         var &= !((GENERATION_COUNT as u64) << bits_shift);
                     }
                 }
@@ -136,13 +133,13 @@ impl<T: Hash> RollingBloomFilter<T> {
         }
 
         let generation = state.current_generation;
-        for idx_opt in hashes.iter() {
+        for idx_opt in &hashes {
             let idx = idx_opt.unwrap();
 
             let byte = &mut state.bits[(idx / ELEMENTS_PER_VAR) % (FILTER_SIZE / 64)];
             let bits_shift = (idx % ELEMENTS_PER_VAR) * GENERATION_BITS;
             *byte &= !((GENERATION_COUNT as u64) << bits_shift);
-            *byte |= (generation as u64) << bits_shift;
+            *byte |= u64::from(generation) << bits_shift;
         }
         state.inserted_since_last_roll += 1;
     }

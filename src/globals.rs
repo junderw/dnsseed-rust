@@ -9,7 +9,7 @@ use bitcoin::{blockdata::constants::genesis_block, Block, BlockHash, Network};
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
 
-/// Wrapper that automatically dereferences OnceLock to its inner value
+/// Wrapper that automatically dereferences `OnceLock` to its inner value
 #[derive(Copy, Clone)]
 pub struct StaticRef<T> {
     inner: T,
@@ -17,6 +17,7 @@ pub struct StaticRef<T> {
 
 impl<T> StaticRef<&'static OnceLock<T>> {
     #[inline]
+    #[allow(clippy::trivially_copy_pass_by_ref)]
     pub fn set(&self, value: T) -> Result<(), T> {
         self.inner.set(value)
     }
@@ -34,7 +35,7 @@ impl<T> Deref for StaticRef<&'static LazyLock<T>> {
     type Target = T;
     #[inline]
     fn deref(&self) -> &T {
-        &**self.inner
+        self.inner
     }
 }
 
@@ -68,12 +69,12 @@ static_ref!(ONCE, DATA_STORE, Store);
 static_ref!(ONCE, PRINTER, Printer);
 static_ref!(ONCE, TOR_PROXY, SocketAddr);
 static_ref!(LAZY, HEADER_MAP, Mutex<HashMap<BlockHash, u64>>, || {
-    let mut map = HashMap::with_capacity(600000);
+    let mut map = HashMap::with_capacity(600_000);
     map.insert(genesis_block(Network::Bitcoin).block_hash(), 0);
     Mutex::new(map)
 });
 static_ref!(LAZY, HEIGHT_MAP, Mutex<HashMap<u64, BlockHash>>, || {
-    let mut map = HashMap::with_capacity(600000);
+    let mut map = HashMap::with_capacity(600_000);
     map.insert(0, genesis_block(Network::Bitcoin).block_hash());
     Mutex::new(map)
 });

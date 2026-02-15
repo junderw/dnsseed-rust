@@ -37,17 +37,20 @@ fn decode_base32(inp: &[u8]) -> Option<Vec<u8>> {
     let mut acc: u16 = 0;
     let mut bits: u8 = 0;
     for i in inp {
-        if *i == '=' as u8 {
+        if *i == b'=' {
             break;
         }
         let codepoint = decode32_table[*i as usize];
         if codepoint < 0 {
             return None;
         }
-        acc = ((acc << 5) | codepoint as u16) & ((1 << (8 + 5 - 1)) - 1);
+        #[allow(clippy::cast_sign_loss)]
+        let codepoint_u16 = codepoint as u16;
+        acc = ((acc << 5) | codepoint_u16) & ((1 << (8 + 5 - 1)) - 1);
         bits += 5;
         while bits >= 8 {
             bits -= 8;
+            #[allow(clippy::cast_possible_truncation)]
             ret.push((acc >> bits) as u8);
         }
     }
@@ -76,6 +79,7 @@ fn test_decode_base32() {
     );
 }
 
+#[allow(clippy::needless_continue)]
 pub fn read(store: &'static Store, printer: &'static Printer, bgp_client: Arc<BGPClient>) {
     tokio::spawn(async move {
         let reader = BufReader::new(stdin());
@@ -84,7 +88,7 @@ pub fn read(store: &'static Store, printer: &'static Printer, bgp_client: Arc<BG
         while let Ok(Some(line)) = lines.next_line().await {
             macro_rules! err {
                 () => {{
-                    printer.add_line(format!("Unparsable input: \"{}\"", line), true);
+                    printer.add_line(format!("Unparsable input: \"{line}\""), true);
                     continue;
                 }};
             }
@@ -113,25 +117,20 @@ pub fn read(store: &'static Store, printer: &'static Printer, bgp_client: Arc<BG
                     if line.len() < 3 || !line.starts_with("s ") {
                         err!();
                     }
-                    store.set_regex(
-                        RegexSetting::SubverRegex,
-                        match line[2..].parse::<Regex>() {
-                            Ok(res) => res,
-                            Err(_) => err!(),
-                        },
-                    );
+                    let Ok(regex) = line[2..].parse::<Regex>() else {
+                        err!();
+                    };
+                    store.set_regex(RegexSetting::SubverRegex, regex);
                 }
                 "a" => {
                     let host_port = get_next_chunk!();
                     let parsed = if host_port.len() > 23 && &host_port[16..23] == ".onion:" {
-                        let port = match host_port[23..].parse::<u16>() {
-                            Ok(res) => res,
-                            Err(_) => err!(),
+                        let Ok(port) = host_port[23..].parse::<u16>() else {
+                            err!();
                         };
 
-                        let ipv6 = match decode_base32(host_port[0..16].as_bytes()) {
-                            Some(res) => res,
-                            None => err!(),
+                        let Some(ipv6) = decode_base32(&host_port.as_bytes()[0..16]) else {
+                            err!();
                         };
                         if ipv6.len() != 10 {
                             err!();
@@ -143,12 +142,12 @@ pub fn read(store: &'static Store, printer: &'static Printer, bgp_client: Arc<BG
 
                         SocketAddr::new(IpAddr::V6(Ipv6Addr::from(octets)), port)
                     } else {
-                        match host_port.parse::<SocketAddr>() {
-                            Ok(res) => res,
-                            Err(_) => err!(),
-                        }
+                        let Ok(res) = host_port.parse::<SocketAddr>() else {
+                            err!();
+                        };
+                        res
                     };
-                    scan_node(Instant::now(), parsed, true)
+                    scan_node(Instant::now(), parsed, true);
                 }
                 "b" => {
                     let ip = try_parse_next_chunk!(IpAddr);
@@ -162,13 +161,16 @@ pub fn read(store: &'static Store, printer: &'static Printer, bgp_client: Arc<BG
                         false,
                     );
                 }
-                "r" => match AddressState::from_num(try_parse_next_chunk!(u8)) {
-                    Some(state) => store.set_u64(
-                        U64Setting::RescanInterval(state),
-                        try_parse_next_chunk!(u64),
-                    ),
-                    None => err!(),
-                },
+                "r" => {
+                    if let Some(state) = AddressState::from_num(try_parse_next_chunk!(u8)) {
+                        store.set_u64(
+                            U64Setting::RescanInterval(state),
+                            try_parse_next_chunk!(u64),
+                        );
+                    } else {
+                        err!();
+                    }
+                }
                 "q" => {
                     START_SHUTDOWN.store(true, Ordering::SeqCst);
                     break;

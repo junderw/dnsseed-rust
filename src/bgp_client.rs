@@ -41,7 +41,7 @@ const ROUTE_LEN: usize = 36 - std::mem::size_of::<(u32, Route)>();
 // To keep memory tight (and since we dont' need such close alignment), newtype the v4/v6 routing
 // table entries to make sure they are aligned to single bytes.
 
-#[repr(packed)]
+#[repr(Rust, packed)]
 #[derive(PartialEq, Eq, Hash)]
 struct V4Addr {
     addr: [u8; 4],
@@ -60,7 +60,7 @@ const V4_ALIGN: usize = 1 - std::mem::align_of::<V4Addr>();
 #[allow(dead_code)]
 const V4_SIZE: usize = 5 - std::mem::size_of::<V4Addr>();
 
-#[repr(packed)]
+#[repr(Rust, packed)]
 #[derive(PartialEq, Eq, Hash)]
 struct V6Addr {
     addr: [u8; 16],
@@ -156,11 +156,11 @@ impl RoutingTable {
                     IpAddr::V6(v6a) => remove!(self.v6_table, (v6a, len), id),
                 }
             }
-            NLRIEncoding::IP_MPLS(_) => (),
-            NLRIEncoding::IP_MPLS_WITH_PATH_ID(_) => (),
-            NLRIEncoding::IP_VPN_MPLS(_) => (),
-            NLRIEncoding::L2VPN(_) => (),
-        };
+            NLRIEncoding::IP_MPLS(_)
+            | NLRIEncoding::IP_MPLS_WITH_PATH_ID(_)
+            | NLRIEncoding::IP_VPN_MPLS(_)
+            | NLRIEncoding::L2VPN(_) => (),
+        }
     }
 
     fn announce(&mut self, prefix: NLRIEncoding, route: Route) {
@@ -203,18 +203,18 @@ impl RoutingTable {
                     IpAddr::V6(v6a) => insert!(self.v6_table, (v6a, len), id),
                 }
             }
-            NLRIEncoding::IP_MPLS(_) => (),
-            NLRIEncoding::IP_MPLS_WITH_PATH_ID(_) => (),
-            NLRIEncoding::IP_VPN_MPLS(_) => (),
-            NLRIEncoding::L2VPN(_) => (),
-        };
+            NLRIEncoding::IP_MPLS(_)
+            | NLRIEncoding::IP_MPLS_WITH_PATH_ID(_)
+            | NLRIEncoding::IP_VPN_MPLS(_)
+            | NLRIEncoding::L2VPN(_) => (),
+        }
     }
 }
 
 struct BytesCoder<'a>(&'a mut bytes::BytesMut);
-impl<'a> std::io::Write for BytesCoder<'a> {
+impl std::io::Write for BytesCoder<'_> {
     fn write(&mut self, b: &[u8]) -> Result<usize, std::io::Error> {
-        self.0.extend_from_slice(&b);
+        self.0.extend_from_slice(b);
         Ok(b.len())
     }
     fn flush(&mut self) -> Result<(), std::io::Error> {
@@ -225,7 +225,7 @@ struct BytesDecoder<'a> {
     buf: &'a mut bytes::BytesMut,
     pos: usize,
 }
-impl<'a> std::io::Read for BytesDecoder<'a> {
+impl std::io::Read for BytesDecoder<'_> {
     fn read(&mut self, b: &mut [u8]) -> Result<usize, std::io::Error> {
         let copy_len = cmp::min(b.len(), self.buf.len() - self.pos);
         b[..copy_len].copy_from_slice(&self.buf[self.pos..self.pos + copy_len]);
@@ -241,7 +241,7 @@ impl Decoder for MsgCoder {
 
     fn decode(&mut self, bytes: &mut bytes::BytesMut) -> Result<Option<Message>, std::io::Error> {
         let mut decoder = BytesDecoder { buf: bytes, pos: 0 };
-        let def_cap = Default::default();
+        let def_cap = Capabilities::default();
         let mut reader = Reader {
             stream: &mut decoder,
             capabilities: if let Some(cap) = &self.0 {
@@ -267,13 +267,14 @@ impl Decoder for MsgCoder {
                 }
                 Ok(Some(msg))
             }
-            Err(e) => match e.kind() {
-                std::io::ErrorKind::UnexpectedEof => Ok(None),
-                _ => {
+            Err(e) => {
+                if e.kind() == std::io::ErrorKind::UnexpectedEof {
+                    Ok(None)
+                } else {
                     error!(error = %e, "BGP message decode error");
                     Err(e)
                 }
-            },
+            }
         }
     }
 }
@@ -334,15 +335,13 @@ impl BGPClient {
                         {
                             if prev_asn != 0 {
                                 return prev_asn;
-                            } else {
-                                // Multi-origin prefix, just give up and take the last AS in the
-                                // default path
-                                break 'asn_candidates;
                             }
-                        } else {
-                            // We only ever possibly return an ASN if it appears in all paths
-                            prev_asn = *asn;
+                            // Multi-origin prefix, just give up and take the last AS in the
+                            // default path
+                            break 'asn_candidates;
                         }
+                        // We only ever possibly return an ASN if it appears in all paths
+                        prev_asn = *asn;
                     }
                 }
             }
@@ -405,6 +404,7 @@ impl BGPClient {
                     Segment::AS_SET(_) => {} // Ignore sets for now, they're not that common anyway
                 }
             }
+            #[allow(clippy::cast_possible_truncation)]
             let path_len = pathvec.len() as u32;
             pathvec.dedup_by(|a, b| (*a).eq(b)); // Drop prepends, cause we don't care in this case
 
@@ -422,11 +422,11 @@ impl BGPClient {
                 pref,
                 med,
             });
-        } else {
-            None
         }
+        None
     }
 
+    #[allow(clippy::too_many_lines)]
     fn connect_given_client(
         remote_asn: u32,
         addr: SocketAddr,
@@ -486,7 +486,8 @@ impl BGPClient {
                     debug!("BGP write stream closed");
                 });
 
-                let peer_asn = if remote_asn > u16::max_value() as u32 {
+                #[allow(clippy::cast_possible_truncation)]
+                let peer_asn = if remote_asn > u32::from(u16::MAX) {
                     23456
                 } else {
                     remote_asn as u16
@@ -504,6 +505,7 @@ impl BGPClient {
                     .send(Message::Open(Open {
                         version: 4,
                         peer_asn,
+                        #[allow(clippy::cast_possible_truncation)]
                         hold_timer: timeout.as_secs() as u16,
                         identifier,
                         parameters: vec![OpenParameter::Capabilities(vec![
@@ -532,7 +534,7 @@ impl BGPClient {
                         Ok(msg) => msg,
                         Err(e) => {
                             error!(peer = %addr, error = ?e, "BGP stream error");
-                            printer.add_line(format!("Got error from BGP stream: {:?}", e), true);
+                            printer.add_line(format!("Got error from BGP stream: {e:?}"), true);
                             break;
                         }
                     };
@@ -588,8 +590,8 @@ impl BGPClient {
                                 "Received BGP NOTIFICATION"
                             );
                         }
-                        msg => {
-                            debug!(peer = %addr, msg_type = ?std::mem::discriminant(&msg), "Received other BGP message");
+                        Message::RouteRefresh(rr) => {
+                            debug!(peer = %addr, msg_type = ?std::mem::discriminant(&Message::RouteRefresh(rr)), "Received other BGP message");
                         }
                     }
                 }

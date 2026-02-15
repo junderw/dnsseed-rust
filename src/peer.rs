@@ -33,8 +33,8 @@ pub enum CodecError {
 impl std::fmt::Display for CodecError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
-            CodecError::Encode(e) => write!(f, "Encode error: {}", e),
-            CodecError::Io(e) => write!(f, "IO error: {}", e),
+            CodecError::Encode(e) => write!(f, "Encode error: {e}"),
+            CodecError::Io(e) => write!(f, "IO error: {e}"),
         }
     }
 }
@@ -54,9 +54,9 @@ impl From<encode::Error> for CodecError {
 }
 
 struct BytesCoder<'a>(&'a mut bytes::BytesMut);
-impl<'a> std::io::Write for BytesCoder<'a> {
+impl std::io::Write for BytesCoder<'_> {
     fn write(&mut self, b: &[u8]) -> Result<usize, std::io::Error> {
-        self.0.extend_from_slice(&b);
+        self.0.extend_from_slice(b);
         Ok(b.len())
     }
     fn flush(&mut self) -> Result<(), std::io::Error> {
@@ -67,7 +67,7 @@ struct BytesDecoder<'a> {
     buf: &'a mut bytes::BytesMut,
     pos: usize,
 }
-impl<'a> std::io::Read for BytesDecoder<'a> {
+impl std::io::Read for BytesDecoder<'_> {
     fn read(&mut self, b: &mut [u8]) -> Result<usize, std::io::Error> {
         let copy_len = cmp::min(b.len(), self.buf.len() - self.pos);
         b[..copy_len].copy_from_slice(&self.buf[self.pos..self.pos + copy_len]);
@@ -101,15 +101,16 @@ impl Decoder for MsgCoder<'_> {
                     Err(encode::Error::ParseFailed("Unexpected network magic").into())
                 }
             }
-            Err(e) => match e {
-                encode::Error::Io(_) => Ok(None),
-                _ => {
+            Err(e) => {
+                if let encode::Error::Io(_) = e {
+                    Ok(None)
+                } else {
                     error!(error = ?e, "Error decoding Bitcoin message");
                     self.0
-                        .add_line(format!("Error decoding message: {:?}", e), true);
+                        .add_line(format!("Error decoding message: {e:?}"), true);
                     Err(e.into())
                 }
-            },
+            }
         }
     }
 }
@@ -121,8 +122,9 @@ impl Encoder<NetworkMessage> for MsgCoder<'_> {
         msg: NetworkMessage,
         res: &mut bytes::BytesMut,
     ) -> Result<(), std::io::Error> {
-        if let Err(_) = RawNetworkMessage::new(Magic::BITCOIN, msg)
+        if RawNetworkMessage::new(Magic::BITCOIN, msg)
             .consensus_encode(FromStd::new_mut(&mut BytesCoder(res)))
+            .is_err()
         {
             //XXX
         }
@@ -135,28 +137,28 @@ impl Encoder<NetworkMessage> for MsgCoder<'_> {
 // Distributed under the MIT software license, see
 // http://www.opensource.org/licenses/mit-license.php.
 fn encode_base32(inp: &[u8]) -> String {
-    let mut ret = String::with_capacity(((inp.len() + 4) / 5) * 8);
+    let mut ret = String::with_capacity(inp.len().div_ceil(5) * 8);
 
     let alphabet = "abcdefghijklmnopqrstuvwxyz234567";
     let mut acc: u16 = 0;
     let mut bits: u8 = 0;
     for i in inp {
-        acc = ((acc << 8) | *i as u16) & ((1 << (8 + 5 - 1)) - 1);
+        acc = ((acc << 8) | u16::from(*i)) & ((1 << (8 + 5 - 1)) - 1);
         bits += 8;
         while bits >= 5 {
             bits -= 5;
             let idx = ((acc >> bits) & ((1 << 5) - 1)) as usize;
-            ret += &alphabet[idx..idx + 1];
+            ret += &alphabet[idx..=idx];
         }
     }
     if bits != 0 {
         let idx = ((acc << (5 - bits)) & ((1 << 5) - 1)) as usize;
-        ret += &alphabet[idx..idx + 1];
+        ret += &alphabet[idx..=idx];
     }
-    while ret.len() % 8 != 0 {
-        ret += "="
+    while !ret.len().is_multiple_of(8) {
+        ret += "=";
     }
-    return ret;
+    ret
 }
 
 #[test]
@@ -211,10 +213,13 @@ async fn connect_via_tor(
     trace!(peer = %addr, hostname = %hostname, "SOCKS5 auth successful, connecting to onion");
 
     let mut connect_msg = Vec::with_capacity(7 + hostname.len());
+    #[allow(clippy::cast_possible_truncation)]
     connect_msg.extend_from_slice(&[5u8, 1u8, 0u8, 3u8, hostname.len() as u8]);
     connect_msg.extend_from_slice(hostname.as_bytes());
+    #[allow(clippy::cast_possible_truncation)]
     connect_msg.push((addr.port() >> 8) as u8);
-    connect_msg.push((addr.port() >> 0) as u8);
+    #[allow(clippy::cast_possible_truncation)]
+    connect_msg.push(addr.port() as u8);
     stream.write_all(&connect_msg).await?;
 
     let mut response = [0u8; 4];
@@ -249,7 +254,12 @@ async fn connect_via_tor(
 
 pub struct Peer {}
 impl Peer {
-    pub async fn new(
+    /// Creates a new peer connection and returns the sender/receiver pair.
+    ///
+    /// # Errors
+    /// Returns `Err(())` if the connection fails or times out.
+    #[allow(clippy::new_ret_no_self)]
+    pub async fn connect(
         addr: SocketAddr,
         tor_proxy: &SocketAddr,
         connect_timeout: Duration,
@@ -267,24 +277,22 @@ impl Peer {
             IpAddr::V6(v6addr)
                 if v6addr.octets()[..6] == [0xFD, 0x87, 0xD8, 0x7E, 0xEB, 0x43][..] =>
             {
-                match connect_via_tor(addr, v6addr, *tor_proxy, connect_timeout).await {
-                    Ok(s) => s,
-                    Err(_) => {
-                        debug!(peer = %addr, "Tor connection failed, scheduling retry delay");
-                        sleep(connect_timeout / 10).await;
-                        return Err(());
-                    }
+                if let Ok(s) = connect_via_tor(addr, v6addr, *tor_proxy, connect_timeout).await {
+                    s
+                } else {
+                    debug!(peer = %addr, "Tor connection failed, scheduling retry delay");
+                    sleep(connect_timeout / 10).await;
+                    return Err(());
                 }
             }
             _ => {
                 trace!(peer = %addr, "Connecting directly (no Tor)");
-                match timeout(connect_timeout, TcpStream::connect(addr)).await {
-                    Ok(Ok(s)) => s,
-                    _ => {
-                        debug!(peer = %addr, "Connection failed, scheduling retry delay");
-                        sleep(connect_timeout / 10).await;
-                        return Err(());
-                    }
+                if let Ok(Ok(s)) = timeout(connect_timeout, TcpStream::connect(addr)).await {
+                    s
+                } else {
+                    debug!(peer = %addr, "Connection failed, scheduling retry delay");
+                    sleep(connect_timeout / 10).await;
+                    return Err(());
                 }
             }
         };
@@ -307,13 +315,14 @@ impl Peer {
             .send(NetworkMessage::Version(VersionMessage {
                 version: 70015,
                 services: ServiceFlags::WITNESS,
+                #[allow(clippy::cast_possible_wrap)]
                 timestamp: SystemTime::now()
                     .duration_since(UNIX_EPOCH)
                     .expect("time > 1970")
                     .as_secs() as i64,
                 receiver: Address::new(&addr, ServiceFlags::NONE),
                 sender: Address::new(&"0.0.0.0:0".parse().unwrap(), ServiceFlags::WITNESS),
-                nonce: 0xdeadbeef,
+                nonce: 0xdead_beef,
                 user_agent: "/rust-bitcoin:0.18/bluematt-tokio-client:0.1/".to_string(),
                 start_height: 0,
                 relay: false,

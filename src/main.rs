@@ -1,3 +1,4 @@
+#![warn(clippy::pedantic)]
 mod bgp_client;
 mod bloom;
 mod datastore;
@@ -37,11 +38,14 @@ use tokio::time::sleep;
 use tracing::info;
 use tracing_subscriber::{fmt, prelude::*, EnvFilter};
 
-use globals::*;
+use globals::{
+    DATA_STORE, HEADER_MAP, HEIGHT_MAP, HIGHEST_HEADER, PRINTER, REQUEST_BLOCK, TOR_PROXY,
+};
 
 pub static START_SHUTDOWN: AtomicBool = AtomicBool::new(false);
 static SCANNING: AtomicBool = AtomicBool::new(false);
 
+#[allow(clippy::struct_excessive_bools)]
 struct PeerState {
     request: Arc<(u64, BlockHash, Block)>,
     pong_nonce: u64,
@@ -55,6 +59,9 @@ struct PeerState {
     recvd_block: bool,
 }
 
+/// # Panics
+/// Panics if any global lock is poisoned.
+#[allow(clippy::too_many_lines)]
 pub fn scan_node(scan_time: Instant, node: SocketAddr, manual: bool) {
     if START_SHUTDOWN.load(Ordering::Relaxed) {
         return;
@@ -80,13 +87,8 @@ pub fn scan_node(scan_time: Instant, node: SocketAddr, manual: bool) {
         PRINTER.set_stat(Stat::NewConnection);
         let timeout = DATA_STORE.get_u64(U64Setting::RunTimeout);
 
-        let peer_result = Peer::new(
-            node.clone(),
-            &TOR_PROXY,
-            Duration::from_secs(timeout),
-            &PRINTER,
-        )
-        .await;
+        let peer_result =
+            Peer::connect(node, &TOR_PROXY, Duration::from_secs(timeout), &PRINTER).await;
 
         if let Ok((write, read)) = peer_result {
             let timeout_stream = TimeoutStream::new_timeout(
@@ -111,6 +113,7 @@ pub fn scan_node(scan_time: Instant, node: SocketAddr, manual: bool) {
                 state_lock.fail_reason = AddressState::TimeoutDuringRequest;
                 match msg {
                     Some(NetworkMessage::Version(ver)) => {
+                        #[allow(clippy::cast_sign_loss)]
                         if ver.start_height < 0
                             || ver.start_height as u64 > state_lock.request.0 + 1008 * 2
                         {
@@ -119,7 +122,8 @@ pub fn scan_node(scan_time: Instant, node: SocketAddr, manual: bool) {
                         }
                         let safe_ua = ver
                             .user_agent
-                            .replace(|c: char| !c.is_ascii() || c < ' ' || c > '~', "");
+                            .replace(|c: char| !c.is_ascii() || !(' '..='~').contains(&c), "");
+                        #[allow(clippy::cast_sign_loss)]
                         if (ver.start_height as u64) < state_lock.request.0 {
                             state_lock.msg = (
                                 format!("({} < {})", ver.start_height, state_lock.request.0),
@@ -129,7 +133,7 @@ pub fn scan_node(scan_time: Instant, node: SocketAddr, manual: bool) {
                             break;
                         }
                         let min_version = DATA_STORE.get_u64(U64Setting::MinProtocolVersion);
-                        if (ver.version as u64) < min_version {
+                        if u64::from(ver.version) < min_version {
                             state_lock.msg = (format!("({} < {})", ver.version, min_version), true);
                             state_lock.fail_reason = AddressState::LowVersion;
                             break;
@@ -146,13 +150,13 @@ pub fn scan_node(scan_time: Instant, node: SocketAddr, manual: bool) {
                             .get_regex(RegexSetting::SubverRegex)
                             .is_match(&ver.user_agent)
                         {
-                            state_lock.msg = (format!("subver {}", safe_ua), true);
+                            state_lock.msg = (format!("subver {safe_ua}"), true);
                             state_lock.fail_reason = AddressState::BadVersion;
                             break;
                         }
                         check_set_flag!(recvd_version, "version");
                         state_lock.node_services = ver.services.to_u64();
-                        state_lock.msg = (format!("(subver: {})", safe_ua), false);
+                        state_lock.msg = (format!("(subver: {safe_ua})"), false);
                         if write.try_send(NetworkMessage::SendAddrV2).is_err() {
                             break;
                         }
@@ -194,15 +198,14 @@ pub fn scan_node(scan_time: Instant, node: SocketAddr, manual: bool) {
                             break;
                         }
                         if addrs.len() > 10 {
-                            if !state_lock.recvd_addrs {
-                                if write
+                            if !state_lock.recvd_addrs
+                                && write
                                     .try_send(NetworkMessage::GetData(vec![
                                         Inventory::WitnessBlock(state_lock.request.1),
                                     ]))
                                     .is_err()
-                                {
-                                    break;
-                                }
+                            {
+                                break;
                             }
                             state_lock.recvd_addrs = true;
                         }
@@ -217,15 +220,14 @@ pub fn scan_node(scan_time: Instant, node: SocketAddr, manual: bool) {
                             break;
                         }
                         if addrs.len() > 10 {
-                            if !state_lock.recvd_addrs {
-                                if write
+                            if !state_lock.recvd_addrs
+                                && write
                                     .try_send(NetworkMessage::GetData(vec![
                                         Inventory::WitnessBlock(state_lock.request.1),
                                     ]))
                                     .is_err()
-                                {
-                                    break;
-                                }
+                            {
+                                break;
                             }
                             state_lock.recvd_addrs = true;
                         }
@@ -260,7 +262,7 @@ pub fn scan_node(scan_time: Instant, node: SocketAddr, manual: bool) {
                     }
                     Some(NetworkMessage::Unknown { command, .. }) => {
                         if command.as_ref() == "gnop" {
-                            state_lock.msg = (format!("(bad msg type {})", command), true);
+                            state_lock.msg = (format!("(bad msg type {command})"), true);
                             state_lock.fail_reason = AddressState::EvilNode;
                             break;
                         }
@@ -282,7 +284,7 @@ pub fn scan_node(scan_time: Instant, node: SocketAddr, manual: bool) {
         {
             let old_state =
                 DATA_STORE.set_node_state(node, AddressState::Good, state_lock.node_services);
-            if manual || (old_state != AddressState::Good && state_lock.msg.0 != "") {
+            if manual || (old_state != AddressState::Good && !state_lock.msg.0.is_empty()) {
                 PRINTER.add_line(
                     format!(
                         "Updating {} from {} to Good {}",
@@ -323,7 +325,7 @@ pub fn scan_node(scan_time: Instant, node: SocketAddr, manual: bool) {
                 );
             } else if manual
                 || (old_state != state_lock.fail_reason
-                    && state_lock.msg.0 != ""
+                    && !state_lock.msg.0.is_empty()
                     && state_lock.msg.1)
             {
                 PRINTER.add_line(
@@ -344,7 +346,7 @@ pub fn scan_node(scan_time: Instant, node: SocketAddr, manual: bool) {
 fn poll_dnsseeds(bgp_client: Arc<BGPClient>) {
     tokio::spawn(async move {
         let mut new_addrs = 0;
-        for seed in [
+        for seed in &[
             "seed.bitcoin.sipa.be",
             "dnsseed.bitcoin.dashjr.org",
             "seed.bitcoinstats.com",
@@ -352,9 +354,7 @@ fn poll_dnsseeds(bgp_client: Arc<BGPClient>) {
             "seed.btc.petertodd.org",
             "seed.bitcoin.sprovoost.nl",
             "dnsseed.emzy.de",
-        ]
-        .iter()
-        {
+        ] {
             new_addrs += DATA_STORE.add_fresh_addrs(
                 (*seed, 8333u16)
                     .to_socket_addrs()
@@ -367,7 +367,7 @@ fn poll_dnsseeds(bgp_client: Arc<BGPClient>) {
             );
         }
         PRINTER.add_line(
-            format!("Added {} new addresses from other DNS seeds", new_addrs),
+            format!("Added {new_addrs} new addresses from other DNS seeds"),
             false,
         );
 
@@ -376,10 +376,10 @@ fn poll_dnsseeds(bgp_client: Arc<BGPClient>) {
         let bgp_clone = Arc::clone(&bgp_client);
         let _ = tokio::join!(DATA_STORE.save_data(), DATA_STORE.write_dns(bgp_clone));
 
-        if !START_SHUTDOWN.load(Ordering::Relaxed) {
-            poll_dnsseeds(bgp_client);
-        } else {
+        if START_SHUTDOWN.load(Ordering::Relaxed) {
             bgp_client.disconnect();
+        } else {
+            poll_dnsseeds(bgp_client);
         }
     });
 }
@@ -410,11 +410,12 @@ fn scan_net() {
     });
 }
 
+#[allow(clippy::too_many_lines)]
 fn make_trusted_conn(trusted_sockaddr: SocketAddr, bgp_client: Arc<BGPClient>) {
     let bgp_reload = Arc::clone(&bgp_client);
     tokio::spawn(async move {
-        let peer_result = Peer::new(
-            trusted_sockaddr.clone(),
+        let peer_result = Peer::connect(
+            trusted_sockaddr,
             &TOR_PROXY,
             Duration::from_secs(600),
             &PRINTER,
@@ -446,7 +447,7 @@ fn make_trusted_conn(trusted_sockaddr: SocketAddr, bgp_client: Arc<BGPClient>) {
                         if trusted_write
                             .try_send(NetworkMessage::GetHeaders(GetHeadersMessage {
                                 version: 70015,
-                                locator_hashes: vec![HIGHEST_HEADER.lock().unwrap().0.clone()],
+                                locator_hashes: vec![HIGHEST_HEADER.lock().unwrap().0],
                                 stop_hash: BlockHash::all_zeros(),
                             }))
                             .is_err()
@@ -467,7 +468,7 @@ fn make_trusted_conn(trusted_sockaddr: SocketAddr, bgp_client: Arc<BGPClient>) {
                         let mut header_map = HEADER_MAP.lock().unwrap();
                         let mut height_map = HEIGHT_MAP.lock().unwrap();
 
-                        if let Some(height) = header_map.get(&headers[0].prev_blockhash).cloned() {
+                        if let Some(height) = header_map.get(&headers[0].prev_blockhash).copied() {
                             let mut should_break = false;
                             for i in 0..headers.len() {
                                 let hash = headers[i].block_hash();
@@ -487,17 +488,17 @@ fn make_trusted_conn(trusted_sockaddr: SocketAddr, bgp_client: Arc<BGPClient>) {
                                 (headers.last().unwrap().block_hash(), top_height);
                             PRINTER.set_stat(printer::Stat::HeaderCount(top_height));
 
-                            if top_height >= starting_height as u64 {
-                                if trusted_write
+                            #[allow(clippy::cast_sign_loss)]
+                            if top_height >= starting_height as u64
+                                && trusted_write
                                     .try_send(NetworkMessage::GetData(vec![
                                         Inventory::WitnessBlock(
-                                            height_map.get(&(top_height - 216)).unwrap().clone(),
+                                            *height_map.get(&(top_height - 216)).unwrap(),
                                         ),
                                     ]))
                                     .is_err()
-                                {
-                                    break;
-                                }
+                            {
+                                break;
                             }
                         } else {
                             // Wat? Lets start again...
@@ -513,7 +514,7 @@ fn make_trusted_conn(trusted_sockaddr: SocketAddr, bgp_client: Arc<BGPClient>) {
                         if trusted_write
                             .try_send(NetworkMessage::GetHeaders(GetHeadersMessage {
                                 version: 70015,
-                                locator_hashes: vec![HIGHEST_HEADER.lock().unwrap().0.clone()],
+                                locator_hashes: vec![HIGHEST_HEADER.lock().unwrap().0],
                                 stop_hash: BlockHash::all_zeros(),
                             }))
                             .is_err()
@@ -557,7 +558,7 @@ fn parse_bgp_identifier(s: &str) -> Result<u32, String> {
     // Try hex format (0x...)
     if let Some(hex_str) = s.strip_prefix("0x").or_else(|| s.strip_prefix("0X")) {
         return u32::from_str_radix(hex_str, 16)
-            .map_err(|e| format!("Invalid hex identifier: {}", e));
+            .map_err(|e| format!("Invalid hex identifier: {e}"));
     }
     // Try IPv4 format (a.b.c.d)
     if s.contains('.') {
@@ -565,22 +566,22 @@ fn parse_bgp_identifier(s: &str) -> Result<u32, String> {
         let mut count = 0;
         for (i, p) in s.split('.').enumerate() {
             if i >= 4 {
-                return Err(format!("Invalid IPv4 identifier: {}", s));
+                return Err(format!("Invalid IPv4 identifier: {s}"));
             }
             match p.parse::<u8>() {
                 Ok(v) => octets[i] = v,
-                Err(_) => return Err(format!("Invalid IPv4 identifier: {}", s)),
+                Err(_) => return Err(format!("Invalid IPv4 identifier: {s}")),
             }
             count = i + 1;
         }
         if count == 4 {
             return Ok(u32::from_be_bytes(octets));
         }
-        return Err(format!("Invalid IPv4 identifier: {}", s));
+        return Err(format!("Invalid IPv4 identifier: {s}"));
     }
     // Try decimal format
     s.parse::<u32>()
-        .map_err(|e| format!("Invalid decimal identifier: {}", e))
+        .map_err(|e| format!("Invalid decimal identifier: {e}"))
 }
 
 fn main() {
@@ -593,7 +594,7 @@ fn main() {
         env::var("RUST_LOG_FILE").unwrap_or_else(|_| format!("dnsseed-{}.log", std::process::id()));
     // Write to file (wrapped in Mutex for thread-safety)
     let file = File::create(&log_file_path)
-        .expect(&format!("Failed to create log file: {}", log_file_path));
+        .unwrap_or_else(|_| panic!("Failed to create log file: {log_file_path}"));
     tracing_subscriber::registry()
         .with(
             fmt::layer()
@@ -604,12 +605,12 @@ fn main() {
         )
         .with(filter)
         .init();
-    eprintln!("Logging to file: {}", log_file_path);
+    eprintln!("Logging to file: {log_file_path}");
 
     info!("Starting dnsseed-rust");
 
-    let argc = env::args().len();
-    if !(6..=7).contains(&argc) {
+    let arg_count = env::args().len();
+    if !(6..=7).contains(&arg_count) {
         println!("USAGE: dnsseed-rust datastore localPeerAddress tor_proxy_addr bgp_peer bgp_peer_asn [bgp_identifier]");
         println!(
             "  bgp_identifier can be: decimal (12345), hex (0x453b1215), or IPv4 (69.59.18.21)"
@@ -630,8 +631,8 @@ fn main() {
     );
     let bgp_sockaddr: SocketAddr = args.next().unwrap().parse().unwrap();
     let bgp_peerasn: u32 = args.next().unwrap().parse().unwrap();
-    let bgp_identifier: u32 = args.next().map_or(0x453b1215, |s| {
-        parse_bgp_identifier(&s).unwrap_or(0x453b1215)
+    let bgp_identifier: u32 = args.next().map_or(0x453b_1215, |s| {
+        parse_bgp_identifier(&s).unwrap_or(0x453b_1215)
     });
 
     info!(

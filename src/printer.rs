@@ -1,4 +1,4 @@
-use std::collections::LinkedList;
+use std::collections::VecDeque;
 use std::io::Write;
 use std::sync::atomic::Ordering;
 use std::sync::{Arc, Mutex};
@@ -7,6 +7,7 @@ use crate::datastore::{AddressState, RegexSetting, Store, U64Setting};
 
 use crate::START_SHUTDOWN;
 
+#[derive(Clone, Copy)]
 pub enum Stat {
     HeaderCount(u64),
     NewConnection,
@@ -17,7 +18,7 @@ pub enum Stat {
 }
 
 struct Stats {
-    lines: LinkedList<String>,
+    lines: VecDeque<String>,
     header_count: u64,
     connection_count: u64,
     v4_table_size: usize,
@@ -30,9 +31,10 @@ pub struct Printer {
 }
 
 impl Printer {
+    #[allow(clippy::too_many_lines)]
     pub fn new(store: &'static Store) -> Printer {
         let stats: Arc<Mutex<Stats>> = Arc::new(Mutex::new(Stats {
-            lines: LinkedList::new(),
+            lines: VecDeque::new(),
             header_count: 0,
             connection_count: 0,
             v4_table_size: 0,
@@ -53,7 +55,7 @@ impl Printer {
                     }
 
                     out.write_all(b"\x1b[2J\x1b[;H\n").unwrap();
-                    for line in stats.lines.iter() {
+                    for line in &stats.lines {
                         out.write_all(line.as_bytes()).unwrap();
                         out.write_all(b"\n").unwrap();
                     }
@@ -73,8 +75,7 @@ impl Printer {
                     let generations = store.get_bloom_node_count();
                     out.write_all(b"Bloom filter generations contain:").unwrap();
                     for generation in &generations {
-                        out.write_all(format!(" {}", generation).as_bytes())
-                            .unwrap();
+                        out.write_all(format!(" {generation}").as_bytes()).unwrap();
                     }
 
                     out.write_all(
@@ -140,9 +141,9 @@ impl Printer {
 
                     out.write_all(b"\nCommands:\n").unwrap();
                     out.write_all(b"q: quit\n").unwrap();
-                    out.write_all(format!(
-							"r x y: Change retry time for status x (int value, see retry times section for name mappings) to y (in seconds)\n"
-							).as_bytes()).unwrap();
+                    out.write_all(
+                        b"r x y: Change retry time for status x (int value, see retry times section for name mappings) to y (in seconds)\n"
+                    ).unwrap();
                     out.write_all(format!(
 							"w x: Change the amount of time a node is considered WAS_GOOD after it fails to x from {} (in seconds)\n",
 							store.get_u64(U64Setting::WasGoodTimeout)

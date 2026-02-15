@@ -1,6 +1,7 @@
 use std::cmp;
 use std::collections::{hash_map, HashMap, HashSet};
 use std::convert::TryInto;
+use std::fmt::Write as _;
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr, SocketAddrV4, SocketAddrV6};
 use std::sync::{Arc, RwLock};
 use std::time::{Duration, Instant};
@@ -62,8 +63,9 @@ impl AddressState {
         }
     }
 
-    pub fn to_num(&self) -> u8 {
-        match *self {
+    #[must_use]
+    pub fn to_num(self) -> u8 {
+        match self {
             AddressState::Untested => 0,
             AddressState::LowBlockCount => 1,
             AddressState::HighBlockCount => 2,
@@ -82,8 +84,9 @@ impl AddressState {
         }
     }
 
-    pub fn to_str(&self) -> &'static str {
-        match *self {
+    #[must_use]
+    pub fn to_str(self) -> &'static str {
+        match self {
             AddressState::Untested => "Untested",
             AddressState::LowBlockCount => "Low Block Count",
             AddressState::HighBlockCount => "High Block Count",
@@ -107,7 +110,7 @@ impl AddressState {
     }
 }
 
-#[derive(Hash, PartialEq, Eq)]
+#[derive(Clone, Copy, Hash, PartialEq, Eq)]
 pub enum U64Setting {
     RunTimeout,
     WasGoodTimeout,
@@ -132,13 +135,13 @@ struct Node {
 impl Node {
     #[inline]
     fn last_services(&self) -> u64 {
-        ((self.last_services.0 as u64) << 32) | (self.last_services.1 as u64)
+        (u64::from(self.last_services.0) << 32) | u64::from(self.last_services.1)
     }
     #[inline]
     fn services(inp: u64) -> (u32, u32) {
         (
-            ((inp & 0xffffffff00000000) >> 32) as u32,
-            (inp & 0x00000000ffffffff) as u32,
+            ((inp & 0xffff_ffff_0000_0000) >> 32) as u32,
+            (inp & 0x0000_0000_ffff_ffff) as u32,
         )
     }
 }
@@ -157,7 +160,7 @@ fn services_test() {
     );
 }
 
-/// Essentially SocketAddr but without a traffic class or scope
+/// Essentially `SocketAddr` but without a traffic class or scope
 #[derive(Clone, PartialEq, Eq, Hash)]
 enum SockAddr {
     V4(SocketAddrV4),
@@ -177,18 +180,18 @@ impl From<SocketAddr> for SockAddr {
         }
     }
 }
-impl Into<SocketAddr> for &SockAddr {
-    fn into(self) -> SocketAddr {
-        match self {
-            &SockAddr::V4(sa) => SocketAddr::V4(sa),
-            &SockAddr::V6(sa) => SocketAddr::V6(SocketAddrV6::new(segs_to_ip6(&sa.0), sa.1, 0, 0)),
+impl From<&SockAddr> for SocketAddr {
+    fn from(val: &SockAddr) -> Self {
+        match *val {
+            SockAddr::V4(sa) => SocketAddr::V4(sa),
+            SockAddr::V6(sa) => SocketAddr::V6(SocketAddrV6::new(segs_to_ip6(&sa.0), sa.1, 0, 0)),
         }
     }
 }
-impl ToString for SockAddr {
-    fn to_string(&self) -> String {
+impl std::fmt::Display for SockAddr {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         let sa: SocketAddr = self.into();
-        sa.to_string()
+        write!(f, "{sa}")
     }
 }
 impl SockAddr {
@@ -200,12 +203,13 @@ impl SockAddr {
     }
     pub fn ip(&self) -> IpAddr {
         match *self {
-            SockAddr::V4(sa) => IpAddr::V4(sa.ip().clone()),
+            SockAddr::V4(sa) => IpAddr::V4(*sa.ip()),
             SockAddr::V6((ip, _)) => IpAddr::V6(segs_to_ip6(&ip)),
         }
     }
 }
 
+#[allow(clippy::struct_field_names)]
 struct Nodes {
     good_node_services: [HashSet<SockAddr>; 64],
     nodes_to_state: HashMap<SockAddr, Node>,
@@ -218,7 +222,7 @@ struct NodesMutRef<'a> {
 }
 
 impl Nodes {
-    fn borrow_mut<'a>(&'a mut self) -> NodesMutRef<'a> {
+    fn borrow_mut(&mut self) -> NodesMutRef<'_> {
         NodesMutRef {
             good_node_services: &mut self.good_node_services,
             nodes_to_state: &mut self.nodes_to_state,
@@ -227,6 +231,7 @@ impl Nodes {
     }
 }
 
+#[allow(clippy::struct_field_names)]
 pub struct Store {
     u64_settings: RwLock<HashMap<U64Setting, u64>>,
     subver_regex: RwLock<Arc<Regex>>,
@@ -237,6 +242,7 @@ pub struct Store {
 }
 
 impl Store {
+    #[allow(clippy::too_many_lines, clippy::single_match_else)]
     pub async fn new(store: String) -> Result<Store, ()> {
         // Load settings
         let (u64_settings, regex) =
@@ -339,7 +345,7 @@ impl Store {
                         U64Setting::RescanInterval(AddressState::ProtocolViolation),
                         86400,
                     );
-                    u64s.insert(U64Setting::RescanInterval(AddressState::Timeout), 604800);
+                    u64s.insert(U64Setting::RescanInterval(AddressState::Timeout), 604_800);
                     u64s.insert(
                         U64Setting::RescanInterval(AddressState::TimeoutDuringRequest),
                         21600,
@@ -360,7 +366,7 @@ impl Store {
                     u64s.insert(U64Setting::RescanInterval(AddressState::WasGood), 1800);
                     u64s.insert(
                         U64Setting::RescanInterval(AddressState::EvilNode),
-                        315360000,
+                        315_360_000,
                     );
                     u64s.insert(U64Setting::MinProtocolVersion, 70002);
                     (u64s, Regex::new(".*").unwrap())
@@ -541,10 +547,7 @@ impl Store {
 
     pub fn add_fresh_addrs<I: Iterator<Item = SocketAddr>>(&self, addresses: I) -> u64 {
         let mut res = 0;
-        let cur_time = (Instant::now() - self.start_time)
-            .as_secs()
-            .try_into()
-            .unwrap();
+        let cur_time = self.start_time.elapsed().as_secs().try_into().unwrap();
         let mut nodes = self.nodes.write().unwrap();
         for addr in addresses {
             match nodes.nodes_to_state.entry(addr.into()) {
@@ -565,20 +568,14 @@ impl Store {
         res
     }
 
-    pub fn add_fresh_nodes(&self, addresses: &Vec<(u32, Address)>) {
+    pub fn add_fresh_nodes(&self, addresses: &[(u32, Address)]) {
         self.add_fresh_addrs(addresses.iter().filter_map(|(_, addr)| {
-            match addr.socket_addr() {
-                Ok(socketaddr) => Some(socketaddr),
-                Err(_) => None, // TODO: Handle onions
-            }
+            addr.socket_addr().ok() // TODO: Handle onions
         }));
     }
-    pub fn add_fresh_nodes_v2(&self, addresses: &Vec<AddrV2Message>) {
+    pub fn add_fresh_nodes_v2(&self, addresses: &[AddrV2Message]) {
         self.add_fresh_addrs(addresses.iter().filter_map(|addr| {
-            match addr.socket_addr() {
-                Ok(socketaddr) => Some(socketaddr),
-                Err(_) => None, // TODO: Handle onions
-            }
+            addr.socket_addr().ok() // TODO: Handle onions
         }));
     }
 
@@ -594,10 +591,7 @@ impl Store {
             return AddressState::Timeout;
         }
 
-        let now = (Instant::now() - self.start_time)
-            .as_secs()
-            .try_into()
-            .unwrap();
+        let now = self.start_time.elapsed().as_secs().try_into().unwrap();
 
         let mut nodes_lock = self.nodes.write().unwrap();
         let nodes = nodes_lock.borrow_mut();
@@ -721,7 +715,7 @@ impl Store {
         {
             let nodes = self.nodes.read().unwrap();
             nodes_buff.reserve(nodes.nodes_to_state.len() * 32);
-            for (ref sockaddr, ref node) in nodes.nodes_to_state.iter() {
+            for (sockaddr, node) in &nodes.nodes_to_state {
                 nodes_buff += &sockaddr.to_string();
                 nodes_buff += ",";
                 nodes_buff += &node.state.to_num().to_string();
@@ -738,11 +732,13 @@ impl Store {
         }
     }
 
+    #[allow(clippy::too_many_lines)]
     pub async fn write_dns(&'static self, bgp_client: Arc<BGPClient>) {
         let dns_file = self.store.clone() + "/nodes.dump";
         let mut dns_buff = String::new();
         {
             let mut rng = rng();
+            #[allow(clippy::unreadable_literal)]
             for i in &[
                 0b00000000001u64,
                 0b00000000100,
@@ -786,7 +782,7 @@ impl Store {
                 }
                 {
                     let nodes = self.nodes.read().unwrap();
-                    if i.count_ones() == 1 {
+                    if i.is_power_of_two() {
                         for j in 0..64 {
                             if i & (1 << j) != 0 {
                                 let set_ref = &nodes.good_node_services[j];
@@ -801,7 +797,7 @@ impl Store {
                         let mut second_set = None;
                         for j in 0..64 {
                             if i & (1 << j) != 0 {
-                                if first_set == None {
+                                if first_set.is_none() {
                                     first_set = Some(&nodes.good_node_services[j]);
                                 } else {
                                     second_set = Some(&nodes.good_node_services[j]);
@@ -811,7 +807,7 @@ impl Store {
                         }
                         for a in first_set
                             .unwrap()
-                            .intersection(&second_set.unwrap())
+                            .intersection(second_set.unwrap())
                             .filter(|e| e.port() == 8333)
                         {
                             add_addr!(a);
@@ -822,13 +818,13 @@ impl Store {
                         let mut intersection_set_ref = None;
                         for j in 0..64 {
                             if i & (1 << j) != 0 {
-                                if intersection_set_ref == None {
+                                if intersection_set_ref.is_none() {
                                     intersection_set_ref = Some(&nodes.good_node_services[j]);
                                 } else {
                                     let new_intersection = intersection_set_ref
                                         .unwrap()
                                         .intersection(&nodes.good_node_services[j])
-                                        .map(|e| (*e).clone())
+                                        .cloned()
                                         .collect();
                                     intersection = Some(new_intersection);
                                     intersection_set_ref = Some(intersection.as_ref().unwrap());
@@ -853,9 +849,9 @@ impl Store {
                     .sample(&mut rng, 21)
                 {
                     if i == &default {
-                        dns_buff += &format!("seed\tIN\tA\t{}\n", a);
+                        let _ = writeln!(dns_buff, "seed\tIN\tA\t{a}");
                     }
-                    dns_buff += &format!("x{:x}.seed\tIN\tA\t{}\n", i, a);
+                    let _ = writeln!(dns_buff, "x{i:x}.seed\tIN\tA\t{a}");
                 }
                 asn_set.clear();
                 asn_set.insert(0);
@@ -865,15 +861,15 @@ impl Store {
                     .sample(&mut rng, 10)
                 {
                     if i == &default {
-                        dns_buff += &format!("seed\tIN\tAAAA\t{}\n", a);
+                        let _ = writeln!(dns_buff, "seed\tIN\tAAAA\t{a}");
                     }
-                    dns_buff += &format!("x{:x}.seed\tIN\tAAAA\t{}\n", i, a);
+                    let _ = writeln!(dns_buff, "x{i:x}.seed\tIN\tAAAA\t{a}");
                 }
                 for a in tor_set.iter().sample(&mut rng, 2) {
                     if i == &default {
-                        dns_buff += &format!("seed\tIN\tAAAA\t{}\n", a);
+                        let _ = writeln!(dns_buff, "seed\tIN\tAAAA\t{a}");
                     }
-                    dns_buff += &format!("x{:x}.seed\tIN\tAAAA\t{}\n", i, a);
+                    let _ = writeln!(dns_buff, "x{i:x}.seed\tIN\tAAAA\t{a}");
                 }
             }
         }
@@ -894,6 +890,7 @@ impl Store {
             for (idx, state_nodes) in nodes.state_next_scan.iter_mut().enumerate() {
                 let rescan_interval = cmp::max(
                     self.get_u64(U64Setting::RescanInterval(
+                        #[allow(clippy::cast_possible_truncation)]
                         AddressState::from_num(idx as u8).unwrap(),
                     )),
                     1,
@@ -905,6 +902,7 @@ impl Store {
                     ),
                     state_nodes.len() as u64,
                 );
+                #[allow(clippy::cast_possible_truncation)]
                 for node in state_nodes.drain(..split_point as usize) {
                     nodes.nodes_to_state.get_mut(&node).unwrap().queued = false;
                     res.push((&node).into());
