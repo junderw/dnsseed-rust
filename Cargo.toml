@@ -13,6 +13,9 @@ futures = "0.1"
 rand = "0.8"
 regex = "1"
 num_cpus = "1"
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+tracing-log = "0.2"
 
 [profile.dev]
 panic = "abort"

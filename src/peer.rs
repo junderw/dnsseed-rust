@@ -18,6 +18,8 @@ use tokio::timer::Delay;
 
 use futures::sync::mpsc;
 
+use tracing::{debug, trace, warn, error};
+
 use crate::printer::Printer;
 
 struct BytesCoder<'a>(&'a mut bytes::BytesMut);
@@ -57,8 +59,14 @@ impl<'a> codec::Decoder for MsgCoder<'a> {
 			Ok(res) => {
 				decoder.buf.advance(decoder.pos);
 				if res.magic == Network::Bitcoin.magic() {
+					trace!(command = ?res.payload.cmd(), "Decoded Bitcoin message");
 					Ok(Some(Some(res.payload)))
 				} else {
+					warn!(
+						expected = res.magic,
+						actual = Network::Bitcoin.magic(),
+						"Unexpected network magic"
+					);
 					Err(encode::Error::UnexpectedNetworkMagic {
 						expected: Network::Bitcoin.magic(),
 						actual: res.magic
@@ -68,6 +76,7 @@ impl<'a> codec::Decoder for MsgCoder<'a> {
 			Err(e) => match e {
 				encode::Error::Io(_) => Ok(None),
 				_ => {
+					error!(error = ?e, "Error decoding Bitcoin message");
 					self.0.add_line(format!("Error decoding message: {:?}", e), true);
 					Err(e)
 				},
@@ -142,19 +151,24 @@ macro_rules! try_write_small {
 pub struct Peer {}
 impl Peer {
 	pub fn new(addr: SocketAddr, tor_proxy: &SocketAddr, timeout: Duration, printer: &'static Printer) -> impl Future<Error=(), Item=(mpsc::Sender<NetworkMessage>, impl Stream<Item=Option<NetworkMessage>, Error=encode::Error>)> {
+		debug!(peer = %addr, timeout_secs = timeout.as_secs(), "Connecting to peer");
 		let connect_timeout = Delay::new(Instant::now() + timeout.clone()).then(|_| {
 			future::err(std::io::Error::new(std::io::ErrorKind::TimedOut, "timeout reached"))
 		});
 		match addr.ip() {
 			IpAddr::V6(v6addr) if v6addr.octets()[..6] == [0xFD,0x87,0xD8,0x7E,0xEB,0x43][..] => {
+				debug!(peer = %addr, proxy = %tor_proxy, "Connecting via Tor proxy");
 				future::Either::A(connect_timeout.select(TcpStream::connect(&tor_proxy)
 					.and_then(move |mut stream: TcpStream| {
+						trace!(peer = %addr, "Tor proxy connected, sending SOCKS5 auth");
 						try_write_small!(stream, &[5u8, 1u8, 0u8]); // SOCKS5 with 1 method and no auth
 						future::Either::B(read_exact(stream, [0u8; 2]).and_then(move |(mut stream, response)| {
 							if response != [5, 0] { // SOCKS5 with no auth successful
+								warn!(peer = %addr, response = ?response, "SOCKS5 authentication failed");
 								future::Either::B(future::Either::A(future::err(std::io::Error::new(std::io::ErrorKind::InvalidData, "Failed to authenticate"))))
 							} else {
 								let hostname = encode_base32(&v6addr.octets()[6..]) + ".onion";
+								trace!(peer = %addr, hostname = %hostname, "SOCKS5 auth successful, connecting to onion");
 								let mut connect_msg = Vec::with_capacity(7 + hostname.len());
 								// SOCKS5 command CONNECT (+ reserved byte) to hostname with given len
 								connect_msg.extend_from_slice(&[5u8, 1u8, 0u8, 3u8, hostname.len() as u8]);
@@ -164,8 +178,10 @@ impl Peer {
 								try_write_small!(stream, &connect_msg);
 								future::Either::B(future::Either::B(read_exact(stream, [0u8; 4]).and_then(move |(stream, response)| {
 									if response[..3] != [5, 0, 0] {
+										warn!(peer = %addr, response = ?response, "SOCKS5 connect failed");
 										future::Either::B(future::err(std::io::Error::new(std::io::ErrorKind::InvalidData, "Failed to authenticate")))
 									} else {
+										trace!(peer = %addr, "SOCKS5 connect successful");
 										if response[3] == 1 {
 											future::Either::A(future::Either::A(read_exact(stream, [0; 6]).and_then(|(stream, _)| future::ok(stream))))
 										} else if response[3] == 4 {
@@ -180,9 +196,13 @@ impl Peer {
 					})
 				).and_then(|(stream, _)| future::ok(stream)).or_else(|(e, _)| future::err(e)))
 			},
-			_ => future::Either::B(connect_timeout.select(TcpStream::connect(&addr))
-				.and_then(|(stream, _)| future::ok(stream)).or_else(|(e, _)| future::err(e))),
+			_ => {
+				trace!(peer = %addr, "Connecting directly (no Tor)");
+				future::Either::B(connect_timeout.select(TcpStream::connect(&addr))
+					.and_then(|(stream, _)| future::ok(stream)).or_else(|(e, _)| future::err(e)))
+			},
 		}.and_then(move |stream| {
+				debug!(peer = %addr, "TCP connection established, sending version");
 				let (write, read) = Framed::new(stream, MsgCoder(printer)).split();
 				let (mut sender, receiver) = mpsc::channel(10); // We never really should send more than 10 messages unless they're dumb
 				tokio::spawn(write.sink_map_err(|_| { () }).send_all(receiver)
@@ -203,6 +223,7 @@ impl Peer {
 				future::ok((sender, read))
 			})
 		.or_else(move |_| {
+			debug!(peer = %addr, "Connection failed, scheduling retry delay");
 			Delay::new(Instant::now() + timeout / 10).then(|_| future::err(()))
 		})
 	}

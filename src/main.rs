@@ -33,6 +33,9 @@ use bgp_client::BGPClient;
 use tokio::prelude::*;
 use tokio::timer::Delay;
 
+use tracing::info;
+use tracing_subscriber::EnvFilter;
+
 static mut REQUEST_BLOCK: Option<Box<Mutex<Arc<(u64, BlockHash, Block)>>>> = None;
 static mut HIGHEST_HEADER: Option<Box<Mutex<(BlockHash, u64)>>> = None;
 static mut HEADER_MAP: Option<Box<Mutex<HashMap<BlockHash, u64>>>> = None;
@@ -458,6 +461,21 @@ fn parse_bgp_identifier(s: &str) -> Result<u32, String> {
 }
 
 fn main() {
+	// Initialize tracing subscriber with env filter
+	// Use RUST_LOG env var to control log levels, e.g. RUST_LOG=debug or RUST_LOG=dnsseed_rust::bgp_client=trace
+	let filter = EnvFilter::try_from_default_env()
+		.unwrap_or_else(|_| EnvFilter::new("info"));
+	tracing_subscriber::fmt()
+		.with_env_filter(filter)
+		.with_target(true)
+		.with_thread_ids(true)
+		.init();
+
+	// Initialize tracing-log bridge to capture log crate events
+	tracing_log::LogTracer::init().expect("Failed to set log tracer");
+
+	info!("Starting dnsseed-rust");
+
 	let argc = env::args().len();
 	if !(6..=7).contains(&argc) {
 		println!("USAGE: dnsseed-rust datastore localPeerAddress tor_proxy_addr bgp_peer bgp_peer_asn [bgp_identifier]");
@@ -487,6 +505,16 @@ fn main() {
 			0x453b1215,
 			|s| parse_bgp_identifier(&s).unwrap_or(0x453b1215),
 		);
+
+	info!(
+		path = %path,
+		trusted_peer = %trusted_sockaddr,
+		tor_proxy = %tor_socks5_sockaddr,
+		bgp_peer = %bgp_sockaddr,
+		bgp_asn = bgp_peerasn,
+		bgp_identifier = format_args!("0x{:08x}", bgp_identifier),
+		"Parsed configuration"
+	);
 
 	let trt = tokio::runtime::Builder::new()
 		.blocking_threads(2).core_threads(num_cpus::get().max(1) + 1)

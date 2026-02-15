@@ -19,6 +19,8 @@ use tokio::timer::Delay;
 
 use futures::sync::mpsc;
 
+use tracing::{debug, info, warn, error, trace};
+
 use crate::printer::{Printer, Stat};
 use crate::timeout_stream::TimeoutStream;
 
@@ -243,14 +245,26 @@ impl codec::Decoder for MsgCoder {
 		match reader.read() {
 			Ok((_header, msg)) => {
 				decoder.buf.advance(decoder.pos);
+				trace!(msg_type = ?std::mem::discriminant(&msg), "Decoded BGP message");
 				if let Message::Open(ref o) = &msg {
+					debug!(
+						version = o.version,
+						peer_asn = o.peer_asn,
+						hold_timer = o.hold_timer,
+						identifier = format_args!("0x{:08x}", o.identifier),
+						params_count = o.parameters.len(),
+						"Received BGP OPEN message"
+					);
 					self.0 = Some(Capabilities::from_parameters(o.parameters.clone()));
 				}
 				Ok(Some(msg))
 			},
 			Err(e) => match e.kind() {
 				std::io::ErrorKind::UnexpectedEof => Ok(None),
-				_ => Err(e),
+				_ => {
+					error!(error = %e, "BGP message decode error");
+					Err(e)
+				},
 			},
 		}
 	}
@@ -260,6 +274,7 @@ impl codec::Encoder for MsgCoder {
 	type Error = std::io::Error;
 
 	fn encode(&mut self, msg: Message, res: &mut bytes::BytesMut) -> Result<(), std::io::Error> {
+		trace!(msg_type = ?std::mem::discriminant(&msg), "Encoding BGP message");
 		msg.encode(&mut BytesCoder(res))?;
 		Ok(())
 	}
@@ -381,24 +396,47 @@ impl BGPClient {
 	}
 
 	fn connect_given_client(remote_asn: u32, addr: SocketAddr, timeout: Duration, printer: &'static Printer, client: Arc<BGPClient>, identifier: u32) {
+		info!(
+			peer = %addr,
+			remote_asn = remote_asn,
+			identifier = format_args!("0x{:08x}", identifier),
+			timeout_secs = timeout.as_secs(),
+			"Initiating BGP connection"
+		);
 		tokio::spawn(Delay::new(Instant::now() + timeout / 4).then(move |_| {
+			debug!(peer = %addr, "Connection delay elapsed, attempting TCP connect");
 			let connect_timeout = Delay::new(Instant::now() + timeout.clone()).then(|_| {
+				warn!("BGP connection timeout reached");
 				future::err(std::io::Error::new(std::io::ErrorKind::TimedOut, "timeout reached"))
 			});
 			let client_reconn = Arc::clone(&client);
 			TcpStream::connect(&addr).select(connect_timeout)
-				.or_else(move |_| {
+				.or_else(move |(e, _)| {
+					warn!(peer = %addr, error = ?e, "BGP TCP connection failed, will retry");
 					Delay::new(Instant::now() + timeout / 2).then(|_| {
 						future::err(())
 					})
 				}).and_then(move |stream| {
+					info!(peer = %addr, "BGP TCP connection established");
 					let (write, read) = Framed::new(stream.0, MsgCoder(None)).split();
 					let (mut sender, receiver) = mpsc::channel(10); // We never really should send more than 10 messages unless they're dumb
-					tokio::spawn(write.sink_map_err(|_| { () }).send_all(receiver)
+					tokio::spawn(write.sink_map_err(|e| {
+						error!(error = ?e, "BGP write stream error");
+					}).send_all(receiver)
 						.then(|_| {
+							debug!("BGP write stream closed");
 							future::err(())
 						}));
 					let peer_asn = if remote_asn > u16::max_value() as u32 { 23456 } else { remote_asn as u16 };
+					debug!(
+						peer = %addr,
+						version = 4,
+						peer_asn = peer_asn,
+						actual_asn = remote_asn,
+						hold_timer = timeout.as_secs(),
+						identifier = format_args!("0x{:08x}", identifier),
+						"Sending BGP OPEN message"
+					);
 					let _ = sender.try_send(Message::Open(Open {
 						version: 4,
 						peer_asn,
@@ -416,26 +454,44 @@ impl BGPClient {
 					}));
 					TimeoutStream::new_persistent(read, timeout).for_each(move |bgp_msg| {
 						if client.shutdown.load(Ordering::Relaxed) {
+							info!(peer = %addr, "BGP client shutdown requested");
 							return future::err(std::io::Error::new(std::io::ErrorKind::Other, "Shutting Down"));
 						}
 						match bgp_msg {
-							Message::Open(_) => {
+							Message::Open(ref open) => {
+								info!(
+									peer = %addr,
+									remote_identifier = format_args!("0x{:08x}", open.identifier),
+									remote_hold_timer = open.hold_timer,
+									remote_version = open.version,
+									"Received BGP OPEN, session established"
+								);
 								client.routes.lock().unwrap().v4_table.clear();
 								client.routes.lock().unwrap().v6_table.clear();
 								printer.add_line("Connected to BGP route provider".to_string(), false);
 							},
 							Message::KeepAlive => {
+								trace!(peer = %addr, "Received BGP KEEPALIVE, sending response");
 								let _ = sender.try_send(Message::KeepAlive);
 							},
 							Message::Update(mut upd) => {
+								trace!(
+									peer = %addr,
+									withdrawn_count = upd.withdrawn_routes.len(),
+									announced_count = upd.announced_routes.len(),
+									attrs_count = upd.attributes.len(),
+									"Received BGP UPDATE"
+								);
 								let _ = sender.try_send(Message::KeepAlive);
 								upd.normalize();
 								let mut route_table = client.routes.lock().unwrap();
 								for r in upd.withdrawn_routes {
+									trace!(route = ?r, "Withdrawing route");
 									route_table.withdraw(r);
 								}
 								if let Some(path) = Self::map_attrs(upd.attributes) {
 									for r in upd.announced_routes {
+										trace!(route = ?r, path_len = path.path_len, "Announcing route");
 										route_table.announce(r, path.clone());
 									}
 								}
@@ -443,16 +499,31 @@ impl BGPClient {
 								printer.set_stat(Stat::V6RoutingTableSize(route_table.v6_table.len()));
 								printer.set_stat(Stat::RoutingTablePaths(route_table.max_paths));
 							},
-							_ => {}
+							Message::Notification(notif) => {
+								error!(
+									peer = %addr,
+									error_code = notif.major_err_code,
+									error_subcode = notif.minor_err_code,
+									data = ?notif.data,
+									"Received BGP NOTIFICATION"
+								);
+							},
+							msg => {
+								debug!(peer = %addr, msg_type = ?std::mem::discriminant(&msg), "Received other BGP message");
+							}
 						}
 						future::ok(())
 					}).or_else(move |e| {
+						error!(peer = %addr, error = ?e, "BGP stream error");
 						printer.add_line(format!("Got error from BGP stream: {:?}", e), true);
 						future::ok(())
 					})
 				}).then(move |_| {
 					if !client_reconn.shutdown.load(Ordering::Relaxed) {
+						info!(peer = %addr, "BGP connection closed, scheduling reconnect");
 						BGPClient::connect_given_client(remote_asn, addr, timeout, printer, client_reconn, identifier);
+					} else {
+						info!(peer = %addr, "BGP connection closed, not reconnecting (shutdown)");
 					}
 					future::ok(())
 				})
@@ -461,6 +532,12 @@ impl BGPClient {
 	}
 
 	pub fn new(remote_asn: u32, addr: SocketAddr, timeout: Duration, printer: &'static Printer, identifier: u32) -> Arc<BGPClient> {
+		info!(
+			peer = %addr,
+			remote_asn = remote_asn,
+			identifier = format_args!("0x{:08x}", identifier),
+			"Creating new BGP client"
+		);
 		let client = Arc::new(BGPClient {
 			routes: Mutex::new(RoutingTable::new()),
 			shutdown: AtomicBool::new(false),
