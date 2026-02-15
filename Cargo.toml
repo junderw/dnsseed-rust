@@ -2,15 +2,15 @@
 name = "dnsseed-rust"
 version = "0.1.0"
 authors = ["matt"]
-edition = "2018"
+edition = "2021"
 
 [dependencies]
-bitcoin = "0.26"
+bitcoin = "0.32"
 bgp-rs = "0.6"
 tokio-util = { version = "0.7", features = ["codec"] }
 bytes = "1"
 futures = "0.3"
-rand = "0.8"
+rand = "0.10"
 regex = "1"
 num_cpus = "1"
 tracing = "0.1"

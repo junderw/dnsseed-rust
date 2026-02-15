@@ -5,9 +5,9 @@ use std::sync::{Arc, RwLock};
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr, SocketAddrV4, SocketAddrV6};
 use std::time::{Duration, Instant};
 
-use bitcoin::network::address::{Address, AddrV2Message};
+use bitcoin::p2p::address::{Address, AddrV2Message};
 
-use rand::thread_rng;
+use rand::rng;
 use rand::seq::{SliceRandom, IteratorRandom};
 
 use tokio::fs::File;
@@ -542,7 +542,7 @@ impl Store {
 		let dns_file = self.store.clone() + "/nodes.dump";
 		let mut dns_buff = String::new();
 		{
-			let mut rng = thread_rng();
+			let mut rng = rng();
 			for i in &[ 0b00000000001u64,
 			            0b00000000100,
 			            0b00000000101,
@@ -627,7 +627,7 @@ impl Store {
 				let mut asn_set = HashSet::with_capacity(cmp::max(v4_set.len(), v6_set.len()));
 				asn_set.insert(0);
 				let default = 1u64;
-				for a in v4_set.iter().filter(|a| asn_set.insert(bgp_client.get_asn(IpAddr::V4(**a)))).choose_multiple(&mut rng, 21) {
+				for a in v4_set.iter().filter(|a| asn_set.insert(bgp_client.get_asn(IpAddr::V4(**a)))).sample(&mut rng, 21) {
 					if i == &default {
 						dns_buff += &format!("seed\tIN\tA\t{}\n", a);
 					}
@@ -635,13 +635,13 @@ impl Store {
 				}
 				asn_set.clear();
 				asn_set.insert(0);
-				for a in v6_set.iter().filter(|a| asn_set.insert(bgp_client.get_asn(IpAddr::V6(**a)))).choose_multiple(&mut rng, 10) {
+				for a in v6_set.iter().filter(|a| asn_set.insert(bgp_client.get_asn(IpAddr::V6(**a)))).sample(&mut rng, 10) {
 					if i == &default {
 						dns_buff += &format!("seed\tIN\tAAAA\t{}\n", a);
 					}
 					dns_buff += &format!("x{:x}.seed\tIN\tAAAA\t{}\n", i, a);
 				}
-				for a in tor_set.iter().choose_multiple(&mut rng, 2) {
+				for a in tor_set.iter().sample(&mut rng, 2) {
 					if i == &default {
 						dns_buff += &format!("seed\tIN\tAAAA\t{}\n", a);
 					}
@@ -674,7 +674,7 @@ impl Store {
 				}
 			}
 		}
-		res.shuffle(&mut thread_rng());
+		res.shuffle(&mut rng());
 		res
 	}
 }

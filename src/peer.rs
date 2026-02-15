@@ -5,10 +5,11 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use bitcoin::consensus::encode;
 use bitcoin::consensus::encode::{Decodable, Encodable};
-use bitcoin::network::address::Address;
-use bitcoin::network::constants::{Network, ServiceFlags};
-use bitcoin::network::message::{RawNetworkMessage, NetworkMessage};
-use bitcoin::network::message_network::VersionMessage;
+use bitcoin::io::FromStd;
+use bitcoin::p2p::address::Address;
+use bitcoin::p2p::{Magic, ServiceFlags};
+use bitcoin::p2p::message::{RawNetworkMessage, NetworkMessage};
+use bitcoin::p2p::message_network::VersionMessage;
 
 use bytes::Buf;
 use tokio::net::TcpStream;
@@ -22,6 +23,35 @@ use futures::{SinkExt, StreamExt, Stream};
 use tracing::{debug, trace, warn, error};
 
 use crate::printer::Printer;
+
+#[derive(Debug)]
+pub enum CodecError {
+	Encode(encode::Error),
+	Io(io::Error),
+}
+
+impl std::fmt::Display for CodecError {
+	fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+		match self {
+			CodecError::Encode(e) => write!(f, "Encode error: {}", e),
+			CodecError::Io(e) => write!(f, "IO error: {}", e),
+		}
+	}
+}
+
+impl std::error::Error for CodecError {}
+
+impl From<io::Error> for CodecError {
+	fn from(e: io::Error) -> Self {
+		CodecError::Io(e)
+	}
+}
+
+impl From<encode::Error> for CodecError {
+	fn from(e: encode::Error) -> Self {
+		CodecError::Encode(e)
+	}
+}
 
 struct BytesCoder<'a>(&'a mut bytes::BytesMut);
 impl<'a> std::io::Write for BytesCoder<'a> {
@@ -49,29 +79,26 @@ impl<'a> std::io::Read for BytesDecoder<'a> {
 struct MsgCoder<'a>(&'a Printer);
 impl Decoder for MsgCoder<'_> {
 	type Item = Option<NetworkMessage>;
-	type Error = encode::Error;
+	type Error = CodecError;
 
-	fn decode(&mut self, bytes: &mut bytes::BytesMut) -> Result<Option<Option<NetworkMessage>>, encode::Error> {
+	fn decode(&mut self, bytes: &mut bytes::BytesMut) -> Result<Option<Option<NetworkMessage>>, CodecError> {
 		let mut decoder = BytesDecoder {
 			buf: bytes,
 			pos: 0
 		};
-		match RawNetworkMessage::consensus_decode(&mut decoder) {
+		match RawNetworkMessage::consensus_decode(FromStd::new_mut(&mut decoder)) {
 			Ok(res) => {
 				decoder.buf.advance(decoder.pos);
-				if res.magic == Network::Bitcoin.magic() {
-					trace!(command = ?res.payload.cmd(), "Decoded Bitcoin message");
-					Ok(Some(Some(res.payload)))
+				if *res.magic() == Magic::BITCOIN {
+					trace!(command = ?res.payload().cmd(), "Decoded Bitcoin message");
+					Ok(Some(Some(res.into_payload())))
 				} else {
 					warn!(
-						expected = res.magic,
-						actual = Network::Bitcoin.magic(),
+						expected = ?res.magic(),
+						actual = ?Magic::BITCOIN,
 						"Unexpected network magic"
 					);
-					Err(encode::Error::UnexpectedNetworkMagic {
-						expected: Network::Bitcoin.magic(),
-						actual: res.magic
-					})
+					Err(encode::Error::ParseFailed("Unexpected network magic").into())
 				}
 			},
 			Err(e) => match e {
@@ -79,7 +106,7 @@ impl Decoder for MsgCoder<'_> {
 				_ => {
 					error!(error = ?e, "Error decoding Bitcoin message");
 					self.0.add_line(format!("Error decoding message: {:?}", e), true);
-					Err(e)
+					Err(e.into())
 				},
 			}
 		}
@@ -89,10 +116,8 @@ impl Encoder<NetworkMessage> for MsgCoder<'_> {
 	type Error = std::io::Error;
 
 	fn encode(&mut self, msg: NetworkMessage, res: &mut bytes::BytesMut) -> Result<(), std::io::Error> {
-		if let Err(_) = (RawNetworkMessage {
-			magic: Network::Bitcoin.magic(),
-			payload: msg,
-		}.consensus_encode(&mut BytesCoder(res))) {
+		if let Err(_) = RawNetworkMessage::new(Magic::BITCOIN, msg)
+			.consensus_encode(FromStd::new_mut(&mut BytesCoder(res))) {
 			//XXX
 		}
 		Ok(())
