@@ -1,6 +1,7 @@
 use std::cmp;
+use std::io;
 use std::net::{SocketAddr, IpAddr};
-use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use bitcoin::consensus::encode;
 use bitcoin::consensus::encode::{Decodable, Encodable};
@@ -9,14 +10,14 @@ use bitcoin::network::constants::{Network, ServiceFlags};
 use bitcoin::network::message::{RawNetworkMessage, NetworkMessage};
 use bitcoin::network::message_network::VersionMessage;
 
-use tokio::prelude::*;
-use tokio::codec;
-use tokio::codec::Framed;
+use bytes::Buf;
 use tokio::net::TcpStream;
-use tokio::io::read_exact;
-use tokio::timer::Delay;
+use tokio::io::{AsyncReadExt, AsyncWriteExt};
+use tokio::time::{timeout, sleep};
+use tokio::sync::mpsc;
+use tokio_util::codec::{Decoder, Encoder, Framed};
 
-use futures::sync::mpsc;
+use futures::{SinkExt, StreamExt, Stream};
 
 use tracing::{debug, trace, warn, error};
 
@@ -46,7 +47,7 @@ impl<'a> std::io::Read for BytesDecoder<'a> {
 }
 
 struct MsgCoder<'a>(&'a Printer);
-impl<'a> codec::Decoder for MsgCoder<'a> {
+impl Decoder for MsgCoder<'_> {
 	type Item = Option<NetworkMessage>;
 	type Error = encode::Error;
 
@@ -84,8 +85,7 @@ impl<'a> codec::Decoder for MsgCoder<'a> {
 		}
 	}
 }
-impl<'a> codec::Encoder for MsgCoder<'a> {
-	type Item = NetworkMessage;
+impl Encoder<NetworkMessage> for MsgCoder<'_> {
 	type Error = std::io::Error;
 
 	fn encode(&mut self, msg: NetworkMessage, res: &mut bytes::BytesMut) -> Result<(), std::io::Error> {
@@ -137,94 +137,115 @@ fn test_encode_base32() {
 	assert_eq!(&encode_base32(&[0x6a, 0x8b, 0xd2, 0x78, 0x3f, 0x7a, 0xf8, 0x92, 0x8f, 0x80]), "nkf5e6b7pl4jfd4a");
 }
 
-/// Note that this should only be used for really small chunks, ie small enough to *definitely* fit
-/// in the outbound TCP buffer, and shouldn't (practically) block.
-macro_rules! try_write_small {
-	($sock: expr, $obj: expr) => { {
-		match $sock.write_all($obj) {
-			Ok(()) => {},
-			Err(e) => return future::Either::A(future::err(e)),
-		}
-	} }
+async fn connect_via_tor(addr: SocketAddr, v6addr: std::net::Ipv6Addr, tor_proxy: SocketAddr, connect_timeout: Duration) -> io::Result<TcpStream> {
+	debug!(peer = %addr, proxy = %tor_proxy, "Connecting via Tor proxy");
+	
+	let mut stream = timeout(connect_timeout, TcpStream::connect(tor_proxy))
+		.await
+		.map_err(|_| io::Error::new(io::ErrorKind::TimedOut, "timeout reached"))??;
+	
+	trace!(peer = %addr, "Tor proxy connected, sending SOCKS5 auth");
+	stream.write_all(&[5u8, 1u8, 0u8]).await?; // SOCKS5 with 1 method and no auth
+	
+	let mut response = [0u8; 2];
+	stream.read_exact(&mut response).await?;
+	
+	if response != [5, 0] {
+		warn!(peer = %addr, response = ?response, "SOCKS5 authentication failed");
+		return Err(io::Error::new(io::ErrorKind::InvalidData, "Failed to authenticate"));
+	}
+	
+	let hostname = encode_base32(&v6addr.octets()[6..]) + ".onion";
+	trace!(peer = %addr, hostname = %hostname, "SOCKS5 auth successful, connecting to onion");
+	
+	let mut connect_msg = Vec::with_capacity(7 + hostname.len());
+	connect_msg.extend_from_slice(&[5u8, 1u8, 0u8, 3u8, hostname.len() as u8]);
+	connect_msg.extend_from_slice(hostname.as_bytes());
+	connect_msg.push((addr.port() >> 8) as u8);
+	connect_msg.push((addr.port() >> 0) as u8);
+	stream.write_all(&connect_msg).await?;
+	
+	let mut response = [0u8; 4];
+	stream.read_exact(&mut response).await?;
+	
+	if response[..3] != [5, 0, 0] {
+		warn!(peer = %addr, response = ?response, "SOCKS5 connect failed");
+		return Err(io::Error::new(io::ErrorKind::InvalidData, "Failed to connect"));
+	}
+	
+	trace!(peer = %addr, "SOCKS5 connect successful");
+	
+	// Read the address bytes
+	if response[3] == 1 {
+		let mut buf = [0u8; 6];
+		stream.read_exact(&mut buf).await?;
+	} else if response[3] == 4 {
+		let mut buf = [0u8; 18];
+		stream.read_exact(&mut buf).await?;
+	} else {
+		return Err(io::Error::new(io::ErrorKind::InvalidData, "Bogus proxy address value"));
+	}
+	
+	Ok(stream)
 }
 
 pub struct Peer {}
 impl Peer {
-	pub fn new(addr: SocketAddr, tor_proxy: &SocketAddr, timeout: Duration, printer: &'static Printer) -> impl Future<Error=(), Item=(mpsc::Sender<NetworkMessage>, impl Stream<Item=Option<NetworkMessage>, Error=encode::Error>)> {
-		debug!(peer = %addr, timeout_secs = timeout.as_secs(), "Connecting to peer");
-		let connect_timeout = Delay::new(Instant::now() + timeout.clone()).then(|_| {
-			future::err(std::io::Error::new(std::io::ErrorKind::TimedOut, "timeout reached"))
-		});
-		match addr.ip() {
+	pub async fn new(addr: SocketAddr, tor_proxy: &SocketAddr, connect_timeout: Duration, printer: &'static Printer) -> Result<(mpsc::Sender<NetworkMessage>, impl Stream<Item=Option<NetworkMessage>>), ()> {
+		debug!(peer = %addr, timeout_secs = connect_timeout.as_secs(), "Connecting to peer");
+		
+		let stream = match addr.ip() {
 			IpAddr::V6(v6addr) if v6addr.octets()[..6] == [0xFD,0x87,0xD8,0x7E,0xEB,0x43][..] => {
-				debug!(peer = %addr, proxy = %tor_proxy, "Connecting via Tor proxy");
-				future::Either::A(connect_timeout.select(TcpStream::connect(&tor_proxy)
-					.and_then(move |mut stream: TcpStream| {
-						trace!(peer = %addr, "Tor proxy connected, sending SOCKS5 auth");
-						try_write_small!(stream, &[5u8, 1u8, 0u8]); // SOCKS5 with 1 method and no auth
-						future::Either::B(read_exact(stream, [0u8; 2]).and_then(move |(mut stream, response)| {
-							if response != [5, 0] { // SOCKS5 with no auth successful
-								warn!(peer = %addr, response = ?response, "SOCKS5 authentication failed");
-								future::Either::B(future::Either::A(future::err(std::io::Error::new(std::io::ErrorKind::InvalidData, "Failed to authenticate"))))
-							} else {
-								let hostname = encode_base32(&v6addr.octets()[6..]) + ".onion";
-								trace!(peer = %addr, hostname = %hostname, "SOCKS5 auth successful, connecting to onion");
-								let mut connect_msg = Vec::with_capacity(7 + hostname.len());
-								// SOCKS5 command CONNECT (+ reserved byte) to hostname with given len
-								connect_msg.extend_from_slice(&[5u8, 1u8, 0u8, 3u8, hostname.len() as u8]);
-								connect_msg.extend_from_slice(hostname.as_bytes());
-								connect_msg.push((addr.port() >> 8) as u8);
-								connect_msg.push((addr.port() >> 0) as u8);
-								try_write_small!(stream, &connect_msg);
-								future::Either::B(future::Either::B(read_exact(stream, [0u8; 4]).and_then(move |(stream, response)| {
-									if response[..3] != [5, 0, 0] {
-										warn!(peer = %addr, response = ?response, "SOCKS5 connect failed");
-										future::Either::B(future::err(std::io::Error::new(std::io::ErrorKind::InvalidData, "Failed to authenticate")))
-									} else {
-										trace!(peer = %addr, "SOCKS5 connect successful");
-										if response[3] == 1 {
-											future::Either::A(future::Either::A(read_exact(stream, [0; 6]).and_then(|(stream, _)| future::ok(stream))))
-										} else if response[3] == 4 {
-											future::Either::A(future::Either::B(read_exact(stream, [0; 18]).and_then(|(stream, _)| future::ok(stream))))
-										} else {
-											future::Either::B(future::err(std::io::Error::new(std::io::ErrorKind::InvalidData, "Bogus proxy address value")))
-										}
-									}
-								})))
-							}
-						}))
-					})
-				).and_then(|(stream, _)| future::ok(stream)).or_else(|(e, _)| future::err(e)))
+				match connect_via_tor(addr, v6addr, *tor_proxy, connect_timeout).await {
+					Ok(s) => s,
+					Err(_) => {
+						debug!(peer = %addr, "Tor connection failed, scheduling retry delay");
+						sleep(connect_timeout / 10).await;
+						return Err(());
+					}
+				}
 			},
 			_ => {
 				trace!(peer = %addr, "Connecting directly (no Tor)");
-				future::Either::B(connect_timeout.select(TcpStream::connect(&addr))
-					.and_then(|(stream, _)| future::ok(stream)).or_else(|(e, _)| future::err(e)))
+				match timeout(connect_timeout, TcpStream::connect(addr)).await {
+					Ok(Ok(s)) => s,
+					_ => {
+						debug!(peer = %addr, "Connection failed, scheduling retry delay");
+						sleep(connect_timeout / 10).await;
+						return Err(());
+					}
+				}
 			},
-		}.and_then(move |stream| {
-				debug!(peer = %addr, "TCP connection established, sending version");
-				let (write, read) = Framed::new(stream, MsgCoder(printer)).split();
-				let (mut sender, receiver) = mpsc::channel(10); // We never really should send more than 10 messages unless they're dumb
-				tokio::spawn(write.sink_map_err(|_| { () }).send_all(receiver)
-					.then(|_| {
-						future::err(())
-					}));
-				let _ = sender.try_send(NetworkMessage::Version(VersionMessage {
-					version: 70015,
-					services: ServiceFlags::WITNESS,
-					timestamp: SystemTime::now().duration_since(UNIX_EPOCH).expect("time > 1970").as_secs() as i64,
-					receiver: Address::new(&addr, ServiceFlags::NONE),
-					sender: Address::new(&"0.0.0.0:0".parse().unwrap(), ServiceFlags::WITNESS),
-					nonce: 0xdeadbeef,
-					user_agent: "/rust-bitcoin:0.18/bluematt-tokio-client:0.1/".to_string(),
-					start_height: 0,
-					relay: false,
-				}));
-				future::ok((sender, read))
-			})
-		.or_else(move |_| {
-			debug!(peer = %addr, "Connection failed, scheduling retry delay");
-			Delay::new(Instant::now() + timeout / 10).then(|_| future::err(()))
-		})
+		};
+		
+		debug!(peer = %addr, "TCP connection established, sending version");
+		let (mut write, read) = Framed::new(stream, MsgCoder(printer)).split();
+		let (sender, mut receiver) = mpsc::channel::<NetworkMessage>(10);
+		
+		// Spawn task to forward messages from channel to stream
+		tokio::spawn(async move {
+			while let Some(msg) = receiver.recv().await {
+				if write.send(msg).await.is_err() {
+					break;
+				}
+			}
+		});
+		
+		let sender_clone = sender.clone();
+		let _ = sender_clone.send(NetworkMessage::Version(VersionMessage {
+			version: 70015,
+			services: ServiceFlags::WITNESS,
+			timestamp: SystemTime::now().duration_since(UNIX_EPOCH).expect("time > 1970").as_secs() as i64,
+			receiver: Address::new(&addr, ServiceFlags::NONE),
+			sender: Address::new(&"0.0.0.0:0".parse().unwrap(), ServiceFlags::WITNESS),
+			nonce: 0xdeadbeef,
+			user_agent: "/rust-bitcoin:0.18/bluematt-tokio-client:0.1/".to_string(),
+			start_height: 0,
+			relay: false,
+		})).await;
+		
+		// Convert Result<Option<NetworkMessage>, Error> to Option<NetworkMessage>
+		let read = read.map(|res| res.ok().flatten());
+		Ok((sender, read))
 	}
 }

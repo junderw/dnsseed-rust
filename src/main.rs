@@ -13,8 +13,10 @@ use std::fs::File;
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
 use std::sync::atomic::{Ordering, AtomicBool};
-use std::time::{Duration, Instant};
+use std::time::Duration;
 use std::net::{SocketAddr, ToSocketAddrs};
+
+use tokio::time::Instant;
 
 use bitcoin::blockdata::block::Block;
 use bitcoin::blockdata::constants::genesis_block;
@@ -31,8 +33,8 @@ use timeout_stream::TimeoutStream;
 use rand::Rng;
 use bgp_client::BGPClient;
 
-use tokio::prelude::*;
-use tokio::timer::Delay;
+use tokio::time::sleep;
+use futures::StreamExt;
 
 use tracing::info;
 use tracing_subscriber::{fmt, EnvFilter, prelude::*};
@@ -78,165 +80,166 @@ pub fn scan_node(scan_time: Instant, node: SocketAddr, manual: bool) {
 		msg: (String::new(), false),
 		request: Arc::clone(&unsafe { REQUEST_BLOCK.as_ref().unwrap() }.lock().unwrap()),
 	}));
-	let err_peer_state = Arc::clone(&peer_state);
 	let final_peer_state = Arc::clone(&peer_state);
 
-	let peer = Delay::new(scan_time).then(move |_| {
+	tokio::spawn(async move {
+		tokio::time::sleep_until(scan_time).await;
 		printer.set_stat(Stat::NewConnection);
 		let timeout = store.get_u64(U64Setting::RunTimeout);
-		Peer::new(node.clone(), unsafe { TOR_PROXY.as_ref().unwrap() }, Duration::from_secs(timeout), printer)
-	});
-	tokio::spawn(peer.and_then(move |(mut write, read)| {
-		TimeoutStream::new_timeout(read, scan_time + Duration::from_secs(store.get_u64(U64Setting::RunTimeout)))
-			.map_err(|_| ()).for_each(move |msg| {
-			let mut state_lock = peer_state.lock().unwrap();
-			macro_rules! check_set_flag {
-				($recvd_flag: ident, $msg: expr) => { {
-					if state_lock.$recvd_flag {
-						state_lock.fail_reason = AddressState::ProtocolViolation;
-						state_lock.msg = (format!("due to dup {}", $msg), true);
-						state_lock.$recvd_flag = false;
-						return future::err(());
-					}
-					state_lock.$recvd_flag = true;
-				} }
-			}
-			state_lock.fail_reason = AddressState::TimeoutDuringRequest;
-			match msg {
-				Some(NetworkMessage::Version(ver)) => {
-					if ver.start_height < 0 || ver.start_height as u64 > state_lock.request.0 + 1008*2 {
-						state_lock.fail_reason = AddressState::HighBlockCount;
-						return future::err(());
-					}
-					let safe_ua = ver.user_agent.replace(|c: char| !c.is_ascii() || c < ' ' || c > '~', "");
-					if (ver.start_height as u64) < state_lock.request.0 {
-						state_lock.msg = (format!("({} < {})", ver.start_height, state_lock.request.0), true);
-						state_lock.fail_reason = AddressState::LowBlockCount;
-						return future::err(());
-					}
-					let min_version = store.get_u64(U64Setting::MinProtocolVersion);
-					if (ver.version as u64) < min_version {
-						state_lock.msg = (format!("({} < {})", ver.version, min_version), true);
-						state_lock.fail_reason = AddressState::LowVersion;
-						return future::err(());
-					}
-					if !ver.services.has(ServiceFlags::NETWORK) && !ver.services.has(ServiceFlags::NETWORK_LIMITED) {
-						state_lock.msg = (format!("({}: services {:x})", safe_ua, ver.services), true);
-						state_lock.fail_reason = AddressState::NotFullNode;
-						return future::err(());
-					}
-					if !store.get_regex(RegexSetting::SubverRegex).is_match(&ver.user_agent) {
-						state_lock.msg = (format!("subver {}", safe_ua), true);
-						state_lock.fail_reason = AddressState::BadVersion;
-						return future::err(());
-					}
-					check_set_flag!(recvd_version, "version");
-					state_lock.node_services = ver.services.as_u64();
-					state_lock.msg = (format!("(subver: {})", safe_ua), false);
-					if let Err(_) = write.try_send(NetworkMessage::SendAddrV2) {
-						return future::err(());
-					}
-					if let Err(_) = write.try_send(NetworkMessage::Verack) {
-						return future::err(());
-					}
-				},
-				Some(NetworkMessage::Verack) => {
-					check_set_flag!(recvd_verack, "verack");
-					if let Err(_) = write.try_send(NetworkMessage::Ping(state_lock.pong_nonce)) {
-						return future::err(());
-					}
-				},
-				Some(NetworkMessage::Ping(v)) => {
-					if let Err(_) = write.try_send(NetworkMessage::Pong(v)) {
-						return future::err(())
-					}
-				},
-				Some(NetworkMessage::Pong(v)) => {
-					if v != state_lock.pong_nonce {
-						state_lock.fail_reason = AddressState::ProtocolViolation;
-						state_lock.msg = ("due to invalid pong nonce".to_string(), true);
-						return future::err(());
-					}
-					check_set_flag!(recvd_pong, "pong");
-					if let Err(_) = write.try_send(NetworkMessage::GetAddr) {
-						return future::err(());
-					}
-				},
-				Some(NetworkMessage::Addr(addrs)) => {
-					if addrs.len() > 1000 {
-						state_lock.fail_reason = AddressState::ProtocolViolation;
-						state_lock.msg = (format!("due to oversized addr: {}", addrs.len()), true);
-						state_lock.recvd_addrs = false;
-						return future::err(());
-					}
-					if addrs.len() > 10 {
-						if !state_lock.recvd_addrs {
-							if let Err(_) = write.try_send(NetworkMessage::GetData(vec![Inventory::WitnessBlock(state_lock.request.1)])) {
-								return future::err(());
+		
+		let peer_result = Peer::new(node.clone(), unsafe { TOR_PROXY.as_ref().unwrap() }, Duration::from_secs(timeout), printer).await;
+		
+		if let Ok((write, read)) = peer_result {
+			let timeout_stream = TimeoutStream::new_timeout(read, scan_time + Duration::from_secs(store.get_u64(U64Setting::RunTimeout)));
+			let mut timeout_stream = std::pin::pin!(timeout_stream);
+			
+			while let Some(msg) = timeout_stream.next().await {
+				let mut state_lock = peer_state.lock().unwrap();
+				macro_rules! check_set_flag {
+					($recvd_flag: ident, $msg: expr) => { {
+						if state_lock.$recvd_flag {
+							state_lock.fail_reason = AddressState::ProtocolViolation;
+							state_lock.msg = (format!("due to dup {}", $msg), true);
+							state_lock.$recvd_flag = false;
+							break;
+						}
+						state_lock.$recvd_flag = true;
+					} }
+				}
+				state_lock.fail_reason = AddressState::TimeoutDuringRequest;
+				match msg {
+					Some(NetworkMessage::Version(ver)) => {
+						if ver.start_height < 0 || ver.start_height as u64 > state_lock.request.0 + 1008*2 {
+							state_lock.fail_reason = AddressState::HighBlockCount;
+							break;
+						}
+						let safe_ua = ver.user_agent.replace(|c: char| !c.is_ascii() || c < ' ' || c > '~', "");
+						if (ver.start_height as u64) < state_lock.request.0 {
+							state_lock.msg = (format!("({} < {})", ver.start_height, state_lock.request.0), true);
+							state_lock.fail_reason = AddressState::LowBlockCount;
+							break;
+						}
+						let min_version = store.get_u64(U64Setting::MinProtocolVersion);
+						if (ver.version as u64) < min_version {
+							state_lock.msg = (format!("({} < {})", ver.version, min_version), true);
+							state_lock.fail_reason = AddressState::LowVersion;
+							break;
+						}
+						if !ver.services.has(ServiceFlags::NETWORK) && !ver.services.has(ServiceFlags::NETWORK_LIMITED) {
+							state_lock.msg = (format!("({}: services {:x})", safe_ua, ver.services), true);
+							state_lock.fail_reason = AddressState::NotFullNode;
+							break;
+						}
+						if !store.get_regex(RegexSetting::SubverRegex).is_match(&ver.user_agent) {
+							state_lock.msg = (format!("subver {}", safe_ua), true);
+							state_lock.fail_reason = AddressState::BadVersion;
+							break;
+						}
+						check_set_flag!(recvd_version, "version");
+						state_lock.node_services = ver.services.as_u64();
+						state_lock.msg = (format!("(subver: {})", safe_ua), false);
+						if write.try_send(NetworkMessage::SendAddrV2).is_err() {
+							break;
+						}
+						if write.try_send(NetworkMessage::Verack).is_err() {
+							break;
+						}
+					},
+					Some(NetworkMessage::Verack) => {
+						check_set_flag!(recvd_verack, "verack");
+						if write.try_send(NetworkMessage::Ping(state_lock.pong_nonce)).is_err() {
+							break;
+						}
+					},
+					Some(NetworkMessage::Ping(v)) => {
+						if write.try_send(NetworkMessage::Pong(v)).is_err() {
+							break;
+						}
+					},
+					Some(NetworkMessage::Pong(v)) => {
+						if v != state_lock.pong_nonce {
+							state_lock.fail_reason = AddressState::ProtocolViolation;
+							state_lock.msg = ("due to invalid pong nonce".to_string(), true);
+							break;
+						}
+						check_set_flag!(recvd_pong, "pong");
+						if write.try_send(NetworkMessage::GetAddr).is_err() {
+							break;
+						}
+					},
+					Some(NetworkMessage::Addr(addrs)) => {
+						if addrs.len() > 1000 {
+							state_lock.fail_reason = AddressState::ProtocolViolation;
+							state_lock.msg = (format!("due to oversized addr: {}", addrs.len()), true);
+							state_lock.recvd_addrs = false;
+							break;
+						}
+						if addrs.len() > 10 {
+							if !state_lock.recvd_addrs {
+								if write.try_send(NetworkMessage::GetData(vec![Inventory::WitnessBlock(state_lock.request.1)])).is_err() {
+									break;
+								}
+							}
+							state_lock.recvd_addrs = true;
+						}
+						unsafe { DATA_STORE.as_ref().unwrap() }.add_fresh_nodes(&addrs);
+					},
+					Some(NetworkMessage::AddrV2(addrs)) => {
+						if addrs.len() > 1000 {
+							state_lock.fail_reason = AddressState::ProtocolViolation;
+							state_lock.msg = (format!("due to oversized addr: {}", addrs.len()), true);
+							state_lock.recvd_addrs = false;
+							break;
+						}
+						if addrs.len() > 10 {
+							if !state_lock.recvd_addrs {
+								if write.try_send(NetworkMessage::GetData(vec![Inventory::WitnessBlock(state_lock.request.1)])).is_err() {
+									break;
+								}
+							}
+							state_lock.recvd_addrs = true;
+						}
+						unsafe { DATA_STORE.as_ref().unwrap() }.add_fresh_nodes_v2(&addrs);
+					},
+					Some(NetworkMessage::Block(block)) => {
+						if block != state_lock.request.2 {
+							state_lock.fail_reason = AddressState::ProtocolViolation;
+							state_lock.msg = ("due to bad block".to_string(), true);
+							break;
+						}
+						check_set_flag!(recvd_block, "block");
+						break;
+					},
+					Some(NetworkMessage::Inv(invs)) => {
+						for inv in invs {
+							match inv {
+								Inventory::Transaction(_) | Inventory::WitnessTransaction(_) => {
+									state_lock.fail_reason = AddressState::EvilNode;
+									state_lock.msg = ("due to unrequested inv tx".to_string(), true);
+									break;
+								}
+								_ => {},
 							}
 						}
-						state_lock.recvd_addrs = true;
-					}
-					unsafe { DATA_STORE.as_ref().unwrap() }.add_fresh_nodes(&addrs);
-				},
-				Some(NetworkMessage::AddrV2(addrs)) => {
-					if addrs.len() > 1000 {
-						state_lock.fail_reason = AddressState::ProtocolViolation;
-						state_lock.msg = (format!("due to oversized addr: {}", addrs.len()), true);
-						state_lock.recvd_addrs = false;
-						return future::err(());
-					}
-					if addrs.len() > 10 {
-						if !state_lock.recvd_addrs {
-							if let Err(_) = write.try_send(NetworkMessage::GetData(vec![Inventory::WitnessBlock(state_lock.request.1)])) {
-								return future::err(());
-							}
-						}
-						state_lock.recvd_addrs = true;
-					}
-					unsafe { DATA_STORE.as_ref().unwrap() }.add_fresh_nodes_v2(&addrs);
-				},
-				Some(NetworkMessage::Block(block)) => {
-					if block != state_lock.request.2 {
-						state_lock.fail_reason = AddressState::ProtocolViolation;
-						state_lock.msg = ("due to bad block".to_string(), true);
-						return future::err(());
-					}
-					check_set_flag!(recvd_block, "block");
-					return future::err(());
-				},
-				Some(NetworkMessage::Inv(invs)) => {
-					for inv in invs {
-						match inv {
-							Inventory::Transaction(_) | Inventory::WitnessTransaction(_) => {
-								state_lock.fail_reason = AddressState::EvilNode;
-								state_lock.msg = ("due to unrequested inv tx".to_string(), true);
-								return future::err(());
-							}
-							_ => {},
-						}
-					}
-				},
-				Some(NetworkMessage::Tx(_)) => {
-					state_lock.fail_reason = AddressState::EvilNode;
-					state_lock.msg = ("due to unrequested transaction".to_string(), true);
-					return future::err(());
-				},
-				Some(NetworkMessage::Unknown { command, .. }) => {
-					if command.as_ref() == "gnop" {
-						let mut state_lock = err_peer_state.lock().unwrap();
-						state_lock.msg = (format!("(bad msg type {})", command), true);
+					},
+					Some(NetworkMessage::Tx(_)) => {
 						state_lock.fail_reason = AddressState::EvilNode;
-						return future::err(());
-					}
-				},
-				_ => {},
+						state_lock.msg = ("due to unrequested transaction".to_string(), true);
+						break;
+					},
+					Some(NetworkMessage::Unknown { command, .. }) => {
+						if command.as_ref() == "gnop" {
+							state_lock.msg = (format!("(bad msg type {})", command), true);
+							state_lock.fail_reason = AddressState::EvilNode;
+							break;
+						}
+					},
+					_ => {},
+				}
 			}
-			future::ok(())
-		}).then(|_| {
-			future::err(())
-		})
-	}).then(move |_: Result<(), ()>| {
+		}
+		
+		// Final state handling
 		let printer = unsafe { PRINTER.as_ref().unwrap() };
 		let store = unsafe { DATA_STORE.as_ref().unwrap() };
 		printer.set_stat(Stat::ConnectionClosed);
@@ -267,12 +270,11 @@ pub fn scan_node(scan_time: Instant, node: SocketAddr, manual: bool) {
 				printer.add_line(format!("Updating {} from {} to {} {}", node, old_state.to_str(), state_lock.fail_reason.to_str(), &state_lock.msg.0), state_lock.msg.1);
 			}
 		}
-		future::ok(())
-	}));
+	});
 }
 
 fn poll_dnsseeds(bgp_client: Arc<BGPClient>) {
-	tokio::spawn(future::lazy(|| {
+	tokio::spawn(async move {
 		let printer = unsafe { PRINTER.as_ref().unwrap() };
 		let store = unsafe { DATA_STORE.as_ref().unwrap() };
 
@@ -282,23 +284,26 @@ fn poll_dnsseeds(bgp_client: Arc<BGPClient>) {
 			new_addrs += store.add_fresh_addrs((("x9.".to_string() + seed).as_str(), 8333u16).to_socket_addrs().unwrap_or(Vec::new().into_iter()));
 		}
 		printer.add_line(format!("Added {} new addresses from other DNS seeds", new_addrs), false);
-		Delay::new(Instant::now() + Duration::from_secs(60)).then(|_| {
-			let store = unsafe { DATA_STORE.as_ref().unwrap() };
-			let dns_future = store.write_dns(Arc::clone(&bgp_client));
-			store.save_data().join(dns_future).then(|_| {
-				if !START_SHUTDOWN.load(Ordering::Relaxed) {
-					poll_dnsseeds(bgp_client);
-				} else {
-					bgp_client.disconnect();
-				}
-				future::ok(())
-			})
-		})
-	}));
+		
+		sleep(Duration::from_secs(60)).await;
+		
+		let store = unsafe { DATA_STORE.as_ref().unwrap() };
+		let bgp_clone = Arc::clone(&bgp_client);
+		let _ = tokio::join!(
+			store.save_data(),
+			store.write_dns(bgp_clone)
+		);
+		
+		if !START_SHUTDOWN.load(Ordering::Relaxed) {
+			poll_dnsseeds(bgp_client);
+		} else {
+			bgp_client.disconnect();
+		}
+	});
 }
 
 fn scan_net() {
-	tokio::spawn(future::lazy(|| {
+	tokio::spawn(async {
 		let printer = unsafe { PRINTER.as_ref().unwrap() };
 		let store = unsafe { DATA_STORE.as_ref().unwrap() };
 
@@ -314,122 +319,131 @@ fn scan_net() {
 				iter_time += per_iter_time;
 			}
 		}
-		Delay::new(start_time + Duration::from_secs(datastore::SECS_PER_SCAN_RESULTS)).then(move |_| {
-			if !START_SHUTDOWN.load(Ordering::Relaxed) {
-				scan_net();
-			}
-			future::ok(())
-		})
-	}));
+		tokio::time::sleep_until(start_time + Duration::from_secs(datastore::SECS_PER_SCAN_RESULTS)).await;
+		if !START_SHUTDOWN.load(Ordering::Relaxed) {
+			scan_net();
+		}
+	});
 }
 
 fn make_trusted_conn(trusted_sockaddr: SocketAddr, bgp_client: Arc<BGPClient>) {
 	let printer = unsafe { PRINTER.as_ref().unwrap() };
-	let trusted_peer = Peer::new(trusted_sockaddr.clone(), unsafe { TOR_PROXY.as_ref().unwrap() }, Duration::from_secs(600), printer);
 	let bgp_reload = Arc::clone(&bgp_client);
-	tokio::spawn(trusted_peer.and_then(move |(mut trusted_write, trusted_read)| {
-		printer.add_line("Connected to local peer".to_string(), false);
-		let mut starting_height = 0;
-		TimeoutStream::new_persistent(trusted_read, Duration::from_secs(600)).map_err(|_| { () }).for_each(move |msg| {
-			if START_SHUTDOWN.load(Ordering::Relaxed) {
-				return future::err(());
-			}
-			match msg {
-				Some(NetworkMessage::Version(ver)) => {
-					if let Err(_) = trusted_write.try_send(NetworkMessage::Verack) {
-						return future::err(())
-					}
-					starting_height = ver.start_height;
-				},
-				Some(NetworkMessage::Verack) => {
-					if let Err(_) = trusted_write.try_send(NetworkMessage::SendHeaders) {
-						return future::err(());
-					}
-					if let Err(_) = trusted_write.try_send(NetworkMessage::GetHeaders(GetHeadersMessage {
-						version: 70015,
-						locator_hashes: vec![unsafe { HIGHEST_HEADER.as_ref().unwrap() }.lock().unwrap().0.clone()],
-						stop_hash: Default::default(),
-					})) {
-						return future::err(());
-					}
-					if let Err(_) = trusted_write.try_send(NetworkMessage::GetAddr) {
-						return future::err(());
-					}
-				},
-				Some(NetworkMessage::Addr(addrs)) => {
-					unsafe { DATA_STORE.as_ref().unwrap() }.add_fresh_nodes(&addrs);
-				},
-				Some(NetworkMessage::Headers(headers)) => {
-					if headers.is_empty() {
-						return future::ok(());
-					}
-					let mut header_map = unsafe { HEADER_MAP.as_ref().unwrap() }.lock().unwrap();
-					let mut height_map = unsafe { HEIGHT_MAP.as_ref().unwrap() }.lock().unwrap();
+	tokio::spawn(async move {
+		let peer_result = Peer::new(trusted_sockaddr.clone(), unsafe { TOR_PROXY.as_ref().unwrap() }, Duration::from_secs(600), printer).await;
+		
+		if let Ok((trusted_write, trusted_read)) = peer_result {
+			printer.add_line("Connected to local peer".to_string(), false);
+			let mut starting_height = 0i32;
+			let timeout_stream = TimeoutStream::new_persistent(trusted_read, Duration::from_secs(600));
+			let mut timeout_stream = std::pin::pin!(timeout_stream);
+			
+			while let Some(msg) = timeout_stream.next().await {
+				if START_SHUTDOWN.load(Ordering::Relaxed) {
+					break;
+				}
+				match msg {
+					Some(NetworkMessage::Version(ver)) => {
+						if trusted_write.try_send(NetworkMessage::Verack).is_err() {
+							break;
+						}
+						starting_height = ver.start_height;
+					},
+					Some(NetworkMessage::Verack) => {
+						if trusted_write.try_send(NetworkMessage::SendHeaders).is_err() {
+							break;
+						}
+						if trusted_write.try_send(NetworkMessage::GetHeaders(GetHeadersMessage {
+							version: 70015,
+							locator_hashes: vec![unsafe { HIGHEST_HEADER.as_ref().unwrap() }.lock().unwrap().0.clone()],
+							stop_hash: Default::default(),
+						})).is_err() {
+							break;
+						}
+						if trusted_write.try_send(NetworkMessage::GetAddr).is_err() {
+							break;
+						}
+					},
+					Some(NetworkMessage::Addr(addrs)) => {
+						unsafe { DATA_STORE.as_ref().unwrap() }.add_fresh_nodes(&addrs);
+					},
+					Some(NetworkMessage::Headers(headers)) => {
+						if headers.is_empty() {
+							continue;
+						}
+						let mut header_map = unsafe { HEADER_MAP.as_ref().unwrap() }.lock().unwrap();
+						let mut height_map = unsafe { HEIGHT_MAP.as_ref().unwrap() }.lock().unwrap();
 
-					if let Some(height) = header_map.get(&headers[0].prev_blockhash).cloned() {
-						for i in 0..headers.len() {
-							let hash = headers[i].block_hash();
-							if i < headers.len() - 1 && headers[i + 1].prev_blockhash != hash {
-								return future::err(());
+						if let Some(height) = header_map.get(&headers[0].prev_blockhash).cloned() {
+							let mut should_break = false;
+							for i in 0..headers.len() {
+								let hash = headers[i].block_hash();
+								if i < headers.len() - 1 && headers[i + 1].prev_blockhash != hash {
+									should_break = true;
+									break;
+								}
+								header_map.insert(headers[i].block_hash(), height + 1 + (i as u64));
+								height_map.insert(height + 1 + (i as u64), headers[i].block_hash());
 							}
-							header_map.insert(headers[i].block_hash(), height + 1 + (i as u64));
-							height_map.insert(height + 1 + (i as u64), headers[i].block_hash());
+							if should_break {
+								break;
+							}
+
+							let top_height = height + headers.len() as u64;
+							*unsafe { HIGHEST_HEADER.as_ref().unwrap() }.lock().unwrap()
+								= (headers.last().unwrap().block_hash(), top_height);
+							printer.set_stat(printer::Stat::HeaderCount(top_height));
+
+							if top_height >= starting_height as u64 {
+								if trusted_write.try_send(NetworkMessage::GetData(vec![
+										Inventory::WitnessBlock(height_map.get(&(top_height - 216)).unwrap().clone())
+								])).is_err() {
+									break;
+								}
+							}
+						} else {
+							// Wat? Lets start again...
+							printer.add_line("Got unconnected headers message from local trusted peer".to_string(), true);
 						}
-
-						let top_height = height + headers.len() as u64;
-						*unsafe { HIGHEST_HEADER.as_ref().unwrap() }.lock().unwrap()
-							= (headers.last().unwrap().block_hash(), top_height);
-						printer.set_stat(printer::Stat::HeaderCount(top_height));
-
-						if top_height >= starting_height as u64 {
-							if let Err(_) = trusted_write.try_send(NetworkMessage::GetData(vec![
-									Inventory::WitnessBlock(height_map.get(&(top_height - 216)).unwrap().clone())
-							])) {
-								return future::err(());
+						// Drop the locks before calling try_send
+						drop(header_map);
+						drop(height_map);
+						if trusted_write.try_send(NetworkMessage::GetHeaders(GetHeadersMessage {
+							version: 70015,
+							locator_hashes: vec![unsafe { HIGHEST_HEADER.as_ref().unwrap() }.lock().unwrap().0.clone()],
+							stop_hash: Default::default(),
+						})).is_err() {
+							break;
+						}
+					},
+					Some(NetworkMessage::Block(block)) => {
+						let hash = block.block_hash();
+						let header_map = unsafe { HEADER_MAP.as_ref().unwrap() }.lock().unwrap();
+						let height = *header_map.get(&hash).expect("Got loose block from trusted peer we coulnd't have requested");
+						if height == unsafe { HIGHEST_HEADER.as_ref().unwrap() }.lock().unwrap().1 - 216 {
+							*unsafe { REQUEST_BLOCK.as_ref().unwrap() }.lock().unwrap() = Arc::new((height, hash, block));
+							if !SCANNING.swap(true, Ordering::SeqCst) {
+								scan_net();
+								poll_dnsseeds(Arc::clone(&bgp_client));
 							}
 						}
-					} else {
-						// Wat? Lets start again...
-						printer.add_line("Got unconnected headers message from local trusted peer".to_string(), true);
-					}
-					if let Err(_) = trusted_write.try_send(NetworkMessage::GetHeaders(GetHeadersMessage {
-						version: 70015,
-						locator_hashes: vec![unsafe { HIGHEST_HEADER.as_ref().unwrap() }.lock().unwrap().0.clone()],
-						stop_hash: Default::default(),
-					})) {
-						return future::err(())
-					}
-				},
-				Some(NetworkMessage::Block(block)) => {
-					let hash = block.block_hash();
-					let header_map = unsafe { HEADER_MAP.as_ref().unwrap() }.lock().unwrap();
-					let height = *header_map.get(&hash).expect("Got loose block from trusted peer we coulnd't have requested");
-					if height == unsafe { HIGHEST_HEADER.as_ref().unwrap() }.lock().unwrap().1 - 216 {
-						*unsafe { REQUEST_BLOCK.as_ref().unwrap() }.lock().unwrap() = Arc::new((height, hash, block));
-						if !SCANNING.swap(true, Ordering::SeqCst) {
-							scan_net();
-							poll_dnsseeds(Arc::clone(&bgp_client));
+					},
+					Some(NetworkMessage::Ping(v)) => {
+						if trusted_write.try_send(NetworkMessage::Pong(v)).is_err() {
+							break;
 						}
-					}
-				},
-				Some(NetworkMessage::Ping(v)) => {
-					if let Err(_) = trusted_write.try_send(NetworkMessage::Pong(v)) {
-						return future::err(())
-					}
-				},
-				_ => {},
+					},
+					_ => {},
+				}
 			}
-			future::ok(())
-		}).then(|_| {
-			future::err(())
-		})
-	}).then(move |_: Result<(), ()>| {
+		}
+		
+		// Reconnect if not shutting down
 		if !START_SHUTDOWN.load(Ordering::Relaxed) {
 			printer.add_line("Lost connection from trusted peer".to_string(), true);
 			make_trusted_conn(trusted_sockaddr, bgp_reload);
 		}
-		future::ok(())
-	}));
+	});
 }
 
 fn parse_bgp_identifier(s: &str) -> Result<u32, String> {
@@ -526,28 +540,36 @@ fn main() {
 		"Parsed configuration"
 	);
 
-	let trt = tokio::runtime::Builder::new()
-		.blocking_threads(2).core_threads(num_cpus::get().max(1) + 1)
+	let rt = tokio::runtime::Builder::new_multi_thread()
+		.worker_threads(num_cpus::get().max(1) + 1)
+		.enable_all()
 		.build().unwrap();
 
-	let _ = trt.block_on_all(future::lazy(move || {
-		Store::new(path).and_then(move |store| {
-			unsafe { DATA_STORE = Some(Box::new(store)) };
-			let store = unsafe { DATA_STORE.as_ref().unwrap() };
-			unsafe { PRINTER = Some(Box::new(Printer::new(store))) };
+	rt.block_on(async move {
+		let store = Store::new(path).await.expect("Failed to initialize store");
+		unsafe { DATA_STORE = Some(Box::new(store)) };
+		let store = unsafe { DATA_STORE.as_ref().unwrap() };
+		unsafe { PRINTER = Some(Box::new(Printer::new(store))) };
 
-			let bgp_client = BGPClient::new(bgp_peerasn, bgp_sockaddr, Duration::from_secs(300), unsafe { PRINTER.as_ref().unwrap() }, bgp_identifier);
-			make_trusted_conn(trusted_sockaddr, Arc::clone(&bgp_client));
+		let bgp_client = BGPClient::new(bgp_peerasn, bgp_sockaddr, Duration::from_secs(300), unsafe { PRINTER.as_ref().unwrap() }, bgp_identifier);
+		make_trusted_conn(trusted_sockaddr, Arc::clone(&bgp_client));
 
-			reader::read(store, unsafe { PRINTER.as_ref().unwrap() }, bgp_client);
+		reader::read(store, unsafe { PRINTER.as_ref().unwrap() }, bgp_client);
+		
+		// Keep the runtime alive - the spawned tasks will run
+		// The runtime will shutdown when START_SHUTDOWN is set and tasks complete
+		loop {
+			sleep(Duration::from_secs(1)).await;
+			if START_SHUTDOWN.load(Ordering::Relaxed) {
+				// Allow some time for cleanup
+				sleep(Duration::from_secs(2)).await;
+				break;
+			}
+		}
+	});
 
-			future::ok(())
-		}).or_else(|_| {
-			future::err(())
-		})
-	}));
-
-	tokio::run(future::lazy(|| {
-		unsafe { DATA_STORE.as_ref().unwrap() }.save_data()
-	}));
+	// Final save on shutdown
+	rt.block_on(async {
+		unsafe { DATA_STORE.as_ref().unwrap() }.save_data().await;
+	});
 }

@@ -7,14 +7,16 @@ edition = "2018"
 [dependencies]
 bitcoin = "0.26"
 bgp-rs = "0.6"
-tokio = "0.1"
-bytes = "0.4"
-futures = "0.1"
+tokio = { version = "1", features = ["full"] }
+tokio-util = { version = "0.7", features = ["codec"] }
+bytes = "1"
+futures = "0.3"
 rand = "0.8"
 regex = "1"
 num_cpus = "1"
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter", "tracing-log"] }
+pin-project-lite = "0.2"
 
 [profile.dev]
 panic = "abort"

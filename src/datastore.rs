@@ -4,16 +4,14 @@ use std::collections::{HashSet, HashMap, hash_map};
 use std::sync::{Arc, RwLock};
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr, SocketAddrV4, SocketAddrV6};
 use std::time::{Duration, Instant};
-use std::io::{BufRead, BufReader};
 
 use bitcoin::network::address::{Address, AddrV2Message};
 
 use rand::thread_rng;
 use rand::seq::{SliceRandom, IteratorRandom};
 
-use tokio::prelude::*;
 use tokio::fs::File;
-use tokio::io::write_all;
+use tokio::io::AsyncWriteExt;
 
 use regex::Regex;
 
@@ -232,65 +230,65 @@ pub struct Store {
 }
 
 impl Store {
-	pub fn new(store: String) -> impl Future<Item=Store, Error=()> {
-		let settings_future = File::open(store.clone() + "/settings").and_then(|f| {
-			let mut l = BufReader::new(f).lines();
-			macro_rules! try_read {
-				($lines: expr, $ty: ty) => { {
-					match $lines.next() {
-						Some(line) => match line {
-							Ok(line) => match line.parse::<$ty>() {
-								Ok(res) => res,
-								Err(e) => return future::err(std::io::Error::new(std::io::ErrorKind::InvalidData, e)),
-							},
-							Err(e) => return future::err(e),
-						},
-						None => return future::err(std::io::Error::new(std::io::ErrorKind::UnexpectedEof, "")),
+	pub async fn new(store: String) -> Result<Store, ()> {
+		// Load settings
+		let (u64_settings, regex) = match tokio::fs::read_to_string(store.clone() + "/settings").await {
+			Ok(content) => {
+				let mut lines = content.lines();
+				macro_rules! try_read {
+					($ty: ty) => {
+						match lines.next().and_then(|l| l.parse::<$ty>().ok()) {
+							Some(v) => v,
+							None => return Err(()),
+						}
 					}
-				} }
+				}
+				let mut u64s = HashMap::with_capacity(AddressState::get_count() as usize + 4);
+				u64s.insert(U64Setting::RunTimeout, try_read!(u64));
+				u64s.insert(U64Setting::WasGoodTimeout, try_read!(u64));
+				u64s.insert(U64Setting::MinProtocolVersion, try_read!(u64));
+				u64s.insert(U64Setting::RescanInterval(AddressState::Untested), try_read!(u64));
+				u64s.insert(U64Setting::RescanInterval(AddressState::LowBlockCount), try_read!(u64));
+				u64s.insert(U64Setting::RescanInterval(AddressState::HighBlockCount), try_read!(u64));
+				u64s.insert(U64Setting::RescanInterval(AddressState::LowVersion), try_read!(u64));
+				u64s.insert(U64Setting::RescanInterval(AddressState::BadVersion), try_read!(u64));
+				u64s.insert(U64Setting::RescanInterval(AddressState::NotFullNode), try_read!(u64));
+				u64s.insert(U64Setting::RescanInterval(AddressState::ProtocolViolation), try_read!(u64));
+				u64s.insert(U64Setting::RescanInterval(AddressState::Timeout), try_read!(u64));
+				u64s.insert(U64Setting::RescanInterval(AddressState::TimeoutDuringRequest), try_read!(u64));
+				u64s.insert(U64Setting::RescanInterval(AddressState::TimeoutAwaitingPong), try_read!(u64));
+				u64s.insert(U64Setting::RescanInterval(AddressState::TimeoutAwaitingAddr), try_read!(u64));
+				u64s.insert(U64Setting::RescanInterval(AddressState::TimeoutAwaitingBlock), try_read!(u64));
+				u64s.insert(U64Setting::RescanInterval(AddressState::Good), try_read!(u64));
+				u64s.insert(U64Setting::RescanInterval(AddressState::WasGood), try_read!(u64));
+				u64s.insert(U64Setting::RescanInterval(AddressState::EvilNode), try_read!(u64));
+				let regex = try_read!(Regex);
+				(u64s, regex)
+			},
+			Err(_) => {
+				// Use defaults
+				let mut u64s = HashMap::with_capacity(15);
+				u64s.insert(U64Setting::RunTimeout, 120);
+				u64s.insert(U64Setting::WasGoodTimeout, 21600);
+				u64s.insert(U64Setting::RescanInterval(AddressState::Untested), 3600);
+				u64s.insert(U64Setting::RescanInterval(AddressState::LowBlockCount), 3600);
+				u64s.insert(U64Setting::RescanInterval(AddressState::HighBlockCount), 7200);
+				u64s.insert(U64Setting::RescanInterval(AddressState::LowVersion), 21600);
+				u64s.insert(U64Setting::RescanInterval(AddressState::BadVersion), 21600);
+				u64s.insert(U64Setting::RescanInterval(AddressState::NotFullNode), 86400);
+				u64s.insert(U64Setting::RescanInterval(AddressState::ProtocolViolation), 86400);
+				u64s.insert(U64Setting::RescanInterval(AddressState::Timeout), 604800);
+				u64s.insert(U64Setting::RescanInterval(AddressState::TimeoutDuringRequest), 21600);
+				u64s.insert(U64Setting::RescanInterval(AddressState::TimeoutAwaitingPong), 3600);
+				u64s.insert(U64Setting::RescanInterval(AddressState::TimeoutAwaitingAddr), 1800);
+				u64s.insert(U64Setting::RescanInterval(AddressState::TimeoutAwaitingBlock), 3600);
+				u64s.insert(U64Setting::RescanInterval(AddressState::Good), 1800);
+				u64s.insert(U64Setting::RescanInterval(AddressState::WasGood), 1800);
+				u64s.insert(U64Setting::RescanInterval(AddressState::EvilNode), 315360000);
+				u64s.insert(U64Setting::MinProtocolVersion, 70002);
+				(u64s, Regex::new(".*").unwrap())
 			}
-			let mut u64s = HashMap::with_capacity(AddressState::get_count() as usize + 4);
-			u64s.insert(U64Setting::RunTimeout, try_read!(l, u64));
-			u64s.insert(U64Setting::WasGoodTimeout, try_read!(l, u64));
-			u64s.insert(U64Setting::MinProtocolVersion, try_read!(l, u64));
-			u64s.insert(U64Setting::RescanInterval(AddressState::Untested), try_read!(l, u64));
-			u64s.insert(U64Setting::RescanInterval(AddressState::LowBlockCount), try_read!(l, u64));
-			u64s.insert(U64Setting::RescanInterval(AddressState::HighBlockCount), try_read!(l, u64));
-			u64s.insert(U64Setting::RescanInterval(AddressState::LowVersion), try_read!(l, u64));
-			u64s.insert(U64Setting::RescanInterval(AddressState::BadVersion), try_read!(l, u64));
-			u64s.insert(U64Setting::RescanInterval(AddressState::NotFullNode), try_read!(l, u64));
-			u64s.insert(U64Setting::RescanInterval(AddressState::ProtocolViolation), try_read!(l, u64));
-			u64s.insert(U64Setting::RescanInterval(AddressState::Timeout), try_read!(l, u64));
-			u64s.insert(U64Setting::RescanInterval(AddressState::TimeoutDuringRequest), try_read!(l, u64));
-			u64s.insert(U64Setting::RescanInterval(AddressState::TimeoutAwaitingPong), try_read!(l, u64));
-			u64s.insert(U64Setting::RescanInterval(AddressState::TimeoutAwaitingAddr), try_read!(l, u64));
-			u64s.insert(U64Setting::RescanInterval(AddressState::TimeoutAwaitingBlock), try_read!(l, u64));
-			u64s.insert(U64Setting::RescanInterval(AddressState::Good), try_read!(l, u64));
-			u64s.insert(U64Setting::RescanInterval(AddressState::WasGood), try_read!(l, u64));
-			u64s.insert(U64Setting::RescanInterval(AddressState::EvilNode), try_read!(l, u64));
-			future::ok((u64s, try_read!(l, Regex)))
-		}).or_else(|_| -> future::FutureResult<(HashMap<U64Setting, u64>, Regex), ()> {
-			let mut u64s = HashMap::with_capacity(15);
-			u64s.insert(U64Setting::RunTimeout, 120);
-			u64s.insert(U64Setting::WasGoodTimeout, 21600);
-			u64s.insert(U64Setting::RescanInterval(AddressState::Untested), 3600);
-			u64s.insert(U64Setting::RescanInterval(AddressState::LowBlockCount), 3600);
-			u64s.insert(U64Setting::RescanInterval(AddressState::HighBlockCount), 7200);
-			u64s.insert(U64Setting::RescanInterval(AddressState::LowVersion), 21600);
-			u64s.insert(U64Setting::RescanInterval(AddressState::BadVersion), 21600);
-			u64s.insert(U64Setting::RescanInterval(AddressState::NotFullNode), 86400);
-			u64s.insert(U64Setting::RescanInterval(AddressState::ProtocolViolation), 86400);
-			u64s.insert(U64Setting::RescanInterval(AddressState::Timeout), 604800);
-			u64s.insert(U64Setting::RescanInterval(AddressState::TimeoutDuringRequest), 21600);
-			u64s.insert(U64Setting::RescanInterval(AddressState::TimeoutAwaitingPong), 3600);
-			u64s.insert(U64Setting::RescanInterval(AddressState::TimeoutAwaitingAddr), 1800);
-			u64s.insert(U64Setting::RescanInterval(AddressState::TimeoutAwaitingBlock), 3600);
-			u64s.insert(U64Setting::RescanInterval(AddressState::Good), 1800);
-			u64s.insert(U64Setting::RescanInterval(AddressState::WasGood), 1800);
-			u64s.insert(U64Setting::RescanInterval(AddressState::EvilNode), 315360000);
-			u64s.insert(U64Setting::MinProtocolVersion, 70002);
-			future::ok((u64s, Regex::new(".*").unwrap()))
-		});
+		};
 
 		macro_rules! nodes_uninitd {
 			() => { {
@@ -304,61 +302,54 @@ impl Store {
 			} }
 		}
 
-		let nodes_future = File::open(store.clone() + "/nodes").and_then(|f| {
-			let mut res = nodes_uninitd!();
-			let l = BufReader::new(f).lines();
-			for line_res in l {
-				let line = match line_res {
-					Ok(l) => l,
-					Err(_) => return future::ok(res),
-				};
-				let mut line_iter = line.split(',');
-				macro_rules! try_read {
-					($lines: expr, $ty: ty) => { {
-						match $lines.next() {
-							Some(line) => match line.parse::<$ty>() {
-								Ok(res) => res,
-								Err(_) => return future::ok(res),
-							},
-							None => return future::ok(res),
-						}
-					} }
-				}
-				let sockaddr = try_read!(line_iter, SocketAddr);
-				let state = try_read!(line_iter, u8);
-				let last_services = try_read!(line_iter, u64);
-				let node = Node {
-					state: match AddressState::from_num(state) {
-						Some(v) => v,
-						None => return future::ok(res),
-					},
-					last_services: Node::services(last_services),
-					last_good: 0,
-					queued: true,
-				};
-				if node.state == AddressState::Good {
-					for i in 0..64 {
-						if node.last_services() & (1 << i) != 0 {
-							res.good_node_services[i].insert(sockaddr.into());
+		// Load nodes
+		let nodes = match tokio::fs::read_to_string(store.clone() + "/nodes").await {
+			Ok(content) => {
+				let mut res = nodes_uninitd!();
+				for line in content.lines() {
+					let mut line_iter = line.split(',');
+					macro_rules! try_read {
+						($ty: ty) => {
+							match line_iter.next().and_then(|s| s.parse::<$ty>().ok()) {
+								Some(v) => v,
+								None => continue,
+							}
 						}
 					}
+					let sockaddr = try_read!(SocketAddr);
+					let state = try_read!(u8);
+					let last_services = try_read!(u64);
+					let node = Node {
+						state: match AddressState::from_num(state) {
+							Some(v) => v,
+							None => continue,
+						},
+						last_services: Node::services(last_services),
+						last_good: 0,
+						queued: true,
+					};
+					if node.state == AddressState::Good {
+						for i in 0..64 {
+							if node.last_services() & (1 << i) != 0 {
+								res.good_node_services[i].insert(sockaddr.into());
+							}
+						}
+					}
+					res.state_next_scan[node.state.to_num() as usize].push(sockaddr.into());
+					res.nodes_to_state.insert(sockaddr.into(), node);
 				}
-				res.state_next_scan[node.state.to_num() as usize].push(sockaddr.into());
-				res.nodes_to_state.insert(sockaddr.into(), node);
-			}
-			future::ok(res)
-		}).or_else(|_| -> future::FutureResult<Nodes, ()> {
-			future::ok(nodes_uninitd!())
-		});
-		settings_future.join(nodes_future).and_then(move |((u64_settings, regex), nodes)| {
-			future::ok(Store {
-				u64_settings: RwLock::new(u64_settings),
-				subver_regex: RwLock::new(Arc::new(regex)),
-				nodes: RwLock::new(nodes),
-				timeout_nodes: RollingBloomFilter::new(),
-				store,
-				start_time: Instant::now(),
-			})
+				res
+			},
+			Err(_) => nodes_uninitd!(),
+		};
+
+		Ok(Store {
+			u64_settings: RwLock::new(u64_settings),
+			subver_regex: RwLock::new(Arc::new(regex)),
+			nodes: RwLock::new(nodes),
+			timeout_nodes: RollingBloomFilter::new(),
+			store,
+			start_time: Instant::now(),
 		})
 	}
 
@@ -496,179 +487,174 @@ impl Store {
 		ret
 	}
 
-	pub fn save_data(&'static self) -> impl Future<Item=(), Error=()> {
+	pub async fn save_data(&'static self) {
 		let settings_file = self.store.clone() + "/settings";
-		let settings_future = File::create(settings_file.clone() + ".tmp").and_then(move |f| {
-			let settings_string = format!("{}\n{}\n{}\n{}\n{}\n{}\n{}\n{}\n{}\n{}\n{}\n{}\n{}\n{}\n{}\n{}\n{}\n{}\n{}",
-				self.get_u64(U64Setting::RunTimeout),
-				self.get_u64(U64Setting::WasGoodTimeout),
-				self.get_u64(U64Setting::MinProtocolVersion),
-				self.get_u64(U64Setting::RescanInterval(AddressState::Untested)),
-				self.get_u64(U64Setting::RescanInterval(AddressState::LowBlockCount)),
-				self.get_u64(U64Setting::RescanInterval(AddressState::HighBlockCount)),
-				self.get_u64(U64Setting::RescanInterval(AddressState::LowVersion)),
-				self.get_u64(U64Setting::RescanInterval(AddressState::BadVersion)),
-				self.get_u64(U64Setting::RescanInterval(AddressState::NotFullNode)),
-				self.get_u64(U64Setting::RescanInterval(AddressState::ProtocolViolation)),
-				self.get_u64(U64Setting::RescanInterval(AddressState::Timeout)),
-				self.get_u64(U64Setting::RescanInterval(AddressState::TimeoutDuringRequest)),
-				self.get_u64(U64Setting::RescanInterval(AddressState::TimeoutAwaitingPong)),
-				self.get_u64(U64Setting::RescanInterval(AddressState::TimeoutAwaitingAddr)),
-				self.get_u64(U64Setting::RescanInterval(AddressState::TimeoutAwaitingBlock)),
-				self.get_u64(U64Setting::RescanInterval(AddressState::Good)),
-				self.get_u64(U64Setting::RescanInterval(AddressState::WasGood)),
-				self.get_u64(U64Setting::RescanInterval(AddressState::EvilNode)),
-				self.get_regex(RegexSetting::SubverRegex).as_str());
-			write_all(f, settings_string).and_then(|(mut f, _)| {
-				f.poll_sync_all()
-			}).and_then(|_| {
-				tokio::fs::rename(settings_file.clone() + ".tmp", settings_file)
-			})
-		});
+		let settings_string = format!("{}\n{}\n{}\n{}\n{}\n{}\n{}\n{}\n{}\n{}\n{}\n{}\n{}\n{}\n{}\n{}\n{}\n{}\n{}",
+			self.get_u64(U64Setting::RunTimeout),
+			self.get_u64(U64Setting::WasGoodTimeout),
+			self.get_u64(U64Setting::MinProtocolVersion),
+			self.get_u64(U64Setting::RescanInterval(AddressState::Untested)),
+			self.get_u64(U64Setting::RescanInterval(AddressState::LowBlockCount)),
+			self.get_u64(U64Setting::RescanInterval(AddressState::HighBlockCount)),
+			self.get_u64(U64Setting::RescanInterval(AddressState::LowVersion)),
+			self.get_u64(U64Setting::RescanInterval(AddressState::BadVersion)),
+			self.get_u64(U64Setting::RescanInterval(AddressState::NotFullNode)),
+			self.get_u64(U64Setting::RescanInterval(AddressState::ProtocolViolation)),
+			self.get_u64(U64Setting::RescanInterval(AddressState::Timeout)),
+			self.get_u64(U64Setting::RescanInterval(AddressState::TimeoutDuringRequest)),
+			self.get_u64(U64Setting::RescanInterval(AddressState::TimeoutAwaitingPong)),
+			self.get_u64(U64Setting::RescanInterval(AddressState::TimeoutAwaitingAddr)),
+			self.get_u64(U64Setting::RescanInterval(AddressState::TimeoutAwaitingBlock)),
+			self.get_u64(U64Setting::RescanInterval(AddressState::Good)),
+			self.get_u64(U64Setting::RescanInterval(AddressState::WasGood)),
+			self.get_u64(U64Setting::RescanInterval(AddressState::EvilNode)),
+			self.get_regex(RegexSetting::SubverRegex).as_str());
+		
+		if let Ok(mut f) = File::create(settings_file.clone() + ".tmp").await {
+			let _ = f.write_all(settings_string.as_bytes()).await;
+			let _ = f.sync_all().await;
+			let _ = tokio::fs::rename(settings_file.clone() + ".tmp", &settings_file).await;
+		}
 
 		let nodes_file = self.store.clone() + "/nodes";
-		let nodes_future = File::create(nodes_file.clone() + ".tmp").and_then(move |f| {
-			let mut nodes_buff = String::new();
-			{
-				let nodes = self.nodes.read().unwrap();
-				nodes_buff.reserve(nodes.nodes_to_state.len() * 32);
-				for (ref sockaddr, ref node) in nodes.nodes_to_state.iter() {
-					nodes_buff += &sockaddr.to_string();
-					nodes_buff += ",";
-					nodes_buff += &node.state.to_num().to_string();
-					nodes_buff += ",";
-					nodes_buff += &node.last_services().to_string();
-					nodes_buff += "\n";
-				}
+		let mut nodes_buff = String::new();
+		{
+			let nodes = self.nodes.read().unwrap();
+			nodes_buff.reserve(nodes.nodes_to_state.len() * 32);
+			for (ref sockaddr, ref node) in nodes.nodes_to_state.iter() {
+				nodes_buff += &sockaddr.to_string();
+				nodes_buff += ",";
+				nodes_buff += &node.state.to_num().to_string();
+				nodes_buff += ",";
+				nodes_buff += &node.last_services().to_string();
+				nodes_buff += "\n";
 			}
-			write_all(f, nodes_buff)
-		}).and_then(|(mut f, _)| {
-			f.poll_sync_all()
-		}).and_then(|_| {
-			tokio::fs::rename(nodes_file.clone() + ".tmp", nodes_file)
-		});
-
-		settings_future.join(nodes_future).then(|_| { future::ok(()) })
+		}
+		
+		if let Ok(mut f) = File::create(nodes_file.clone() + ".tmp").await {
+			let _ = f.write_all(nodes_buff.as_bytes()).await;
+			let _ = f.sync_all().await;
+			let _ = tokio::fs::rename(nodes_file.clone() + ".tmp", &nodes_file).await;
+		}
 	}
 
-	pub fn write_dns(&'static self, bgp_client: Arc<BGPClient>) -> impl Future<Item=(), Error=()> {
+	pub async fn write_dns(&'static self, bgp_client: Arc<BGPClient>) {
 		let dns_file = self.store.clone() + "/nodes.dump";
-		File::create(dns_file.clone() + ".tmp").and_then(move |f| {
-			let mut dns_buff = String::new();
-			{
-				let mut rng = thread_rng();
-				for i in &[ 0b00000000001u64,
-				            0b00000000100,
-				            0b00000000101,
-				            0b00000001000,
-				            0b00000001001,
-				            0b00000001100,
-				            0b00000001101,
-				            0b00001001001,
-				            0b10000000000,
-				            0b10000000001,
-				            0b10000000100,
-				            0b10000000101,
-				            0b10000001000,
-				            0b10000001001,
-				            0b10000001100,
-				            0b10000001101,
-				            0b10001001000] {
-				//            ^ NODE_NETWORK_LIIMTED
-				//COMPACT_FILTERS ^   ^ NODE_BLOOM
-				//      NODE_WITNESS ^  ^ NODE_NETWORK
-				// We support all combos of NETWORK, NETWORK_LIMITED, BLOOM, and WITNESS
-				// We support COMPACT_FILTERS with WITNESS and NETWORK or NETWORK_LIIMTED.
-					let mut tor_set: Vec<Ipv6Addr> = Vec::new();
-					let mut v6_set: Vec<Ipv6Addr> = Vec::new();
-					let mut v4_set: Vec<Ipv4Addr> = Vec::new();
-					macro_rules! add_addr { ($addr: expr) => {
-						match $addr.ip() {
-							IpAddr::V4(v4addr) => v4_set.push(v4addr),
-							IpAddr::V6(v6addr) if v6addr.octets()[..6] == [0xFD,0x87,0xD8,0x7E,0xEB,0x43][..] => tor_set.push(v6addr),
-							IpAddr::V6(v6addr) => v6_set.push(v6addr),
+		let mut dns_buff = String::new();
+		{
+			let mut rng = thread_rng();
+			for i in &[ 0b00000000001u64,
+			            0b00000000100,
+			            0b00000000101,
+			            0b00000001000,
+			            0b00000001001,
+			            0b00000001100,
+			            0b00000001101,
+			            0b00001001001,
+			            0b10000000000,
+			            0b10000000001,
+			            0b10000000100,
+			            0b10000000101,
+			            0b10000001000,
+			            0b10000001001,
+			            0b10000001100,
+			            0b10000001101,
+			            0b10001001000] {
+			//            ^ NODE_NETWORK_LIIMTED
+			//COMPACT_FILTERS ^   ^ NODE_BLOOM
+			//      NODE_WITNESS ^  ^ NODE_NETWORK
+			// We support all combos of NETWORK, NETWORK_LIMITED, BLOOM, and WITNESS
+			// We support COMPACT_FILTERS with WITNESS and NETWORK or NETWORK_LIIMTED.
+				let mut tor_set: Vec<Ipv6Addr> = Vec::new();
+				let mut v6_set: Vec<Ipv6Addr> = Vec::new();
+				let mut v4_set: Vec<Ipv4Addr> = Vec::new();
+				macro_rules! add_addr { ($addr: expr) => {
+					match $addr.ip() {
+						IpAddr::V4(v4addr) => v4_set.push(v4addr),
+						IpAddr::V6(v6addr) if v6addr.octets()[..6] == [0xFD,0x87,0xD8,0x7E,0xEB,0x43][..] => tor_set.push(v6addr),
+						IpAddr::V6(v6addr) => v6_set.push(v6addr),
+					}
+				} }
+				{
+					let nodes = self.nodes.read().unwrap();
+					if i.count_ones() == 1 {
+						for j in 0..64 {
+							if i & (1 << j) != 0 {
+								let set_ref = &nodes.good_node_services[j];
+								for a in set_ref.iter().filter(|e| e.port() == 8333) {
+									add_addr!(a);
+								}
+								break;
+							}
 						}
-					} }
-					{
-						let nodes = self.nodes.read().unwrap();
-						if i.count_ones() == 1 {
-							for j in 0..64 {
-								if i & (1 << j) != 0 {
-									let set_ref = &nodes.good_node_services[j];
-									for a in set_ref.iter().filter(|e| e.port() == 8333) {
-										add_addr!(a);
-									}
+					} else if i.count_ones() == 2 {
+						let mut first_set = None;
+						let mut second_set = None;
+						for j in 0..64 {
+							if i & (1 << j) != 0 {
+								if first_set == None {
+									first_set = Some(&nodes.good_node_services[j]);
+								} else {
+									second_set = Some(&nodes.good_node_services[j]);
 									break;
 								}
 							}
-						} else if i.count_ones() == 2 {
-							let mut first_set = None;
-							let mut second_set = None;
-							for j in 0..64 {
-								if i & (1 << j) != 0 {
-									if first_set == None {
-										first_set = Some(&nodes.good_node_services[j]);
-									} else {
-										second_set = Some(&nodes.good_node_services[j]);
-										break;
-									}
+						}
+						for a in first_set.unwrap().intersection(&second_set.unwrap()).filter(|e| e.port() == 8333) {
+							add_addr!(a);
+						}
+					} else {
+						//TODO: Could optimize this one a bit
+						let mut intersection;
+						let mut intersection_set_ref = None;
+						for j in 0..64 {
+							if i & (1 << j) != 0 {
+								if intersection_set_ref == None {
+									intersection_set_ref = Some(&nodes.good_node_services[j]);
+								} else {
+									let new_intersection = intersection_set_ref.unwrap()
+										.intersection(&nodes.good_node_services[j]).map(|e| (*e).clone()).collect();
+									intersection = Some(new_intersection);
+									intersection_set_ref = Some(intersection.as_ref().unwrap());
 								}
 							}
-							for a in first_set.unwrap().intersection(&second_set.unwrap()).filter(|e| e.port() == 8333) {
-								add_addr!(a);
-							}
-						} else {
-							//TODO: Could optimize this one a bit
-							let mut intersection;
-							let mut intersection_set_ref = None;
-							for j in 0..64 {
-								if i & (1 << j) != 0 {
-									if intersection_set_ref == None {
-										intersection_set_ref = Some(&nodes.good_node_services[j]);
-									} else {
-										let new_intersection = intersection_set_ref.unwrap()
-											.intersection(&nodes.good_node_services[j]).map(|e| (*e).clone()).collect();
-										intersection = Some(new_intersection);
-										intersection_set_ref = Some(intersection.as_ref().unwrap());
-									}
-								}
-							}
-							for a in intersection_set_ref.unwrap().iter().filter(|e| e.port() == 8333) {
-								add_addr!(a);
-							}
 						}
-					}
-					let mut asn_set = HashSet::with_capacity(cmp::max(v4_set.len(), v6_set.len()));
-					asn_set.insert(0);
-					let default = 1u64;
-					for a in v4_set.iter().filter(|a| asn_set.insert(bgp_client.get_asn(IpAddr::V4(**a)))).choose_multiple(&mut rng, 21) {
-						if i == &default {
-							dns_buff += &format!("seed\tIN\tA\t{}\n", a);
+						for a in intersection_set_ref.unwrap().iter().filter(|e| e.port() == 8333) {
+							add_addr!(a);
 						}
-						dns_buff += &format!("x{:x}.seed\tIN\tA\t{}\n", i, a);
-					}
-					asn_set.clear();
-					asn_set.insert(0);
-					for a in v6_set.iter().filter(|a| asn_set.insert(bgp_client.get_asn(IpAddr::V6(**a)))).choose_multiple(&mut rng, 10) {
-						if i == &default {
-							dns_buff += &format!("seed\tIN\tAAAA\t{}\n", a);
-						}
-						dns_buff += &format!("x{:x}.seed\tIN\tAAAA\t{}\n", i, a);
-					}
-					for a in tor_set.iter().choose_multiple(&mut rng, 2) {
-						if i == &default {
-							dns_buff += &format!("seed\tIN\tAAAA\t{}\n", a);
-						}
-						dns_buff += &format!("x{:x}.seed\tIN\tAAAA\t{}\n", i, a);
 					}
 				}
+				let mut asn_set = HashSet::with_capacity(cmp::max(v4_set.len(), v6_set.len()));
+				asn_set.insert(0);
+				let default = 1u64;
+				for a in v4_set.iter().filter(|a| asn_set.insert(bgp_client.get_asn(IpAddr::V4(**a)))).choose_multiple(&mut rng, 21) {
+					if i == &default {
+						dns_buff += &format!("seed\tIN\tA\t{}\n", a);
+					}
+					dns_buff += &format!("x{:x}.seed\tIN\tA\t{}\n", i, a);
+				}
+				asn_set.clear();
+				asn_set.insert(0);
+				for a in v6_set.iter().filter(|a| asn_set.insert(bgp_client.get_asn(IpAddr::V6(**a)))).choose_multiple(&mut rng, 10) {
+					if i == &default {
+						dns_buff += &format!("seed\tIN\tAAAA\t{}\n", a);
+					}
+					dns_buff += &format!("x{:x}.seed\tIN\tAAAA\t{}\n", i, a);
+				}
+				for a in tor_set.iter().choose_multiple(&mut rng, 2) {
+					if i == &default {
+						dns_buff += &format!("seed\tIN\tAAAA\t{}\n", a);
+					}
+					dns_buff += &format!("x{:x}.seed\tIN\tAAAA\t{}\n", i, a);
+				}
 			}
-			write_all(f, dns_buff)
-		}).and_then(|(mut f, _)| {
-			f.poll_sync_all()
-		}).and_then(|_| {
-			tokio::fs::rename(dns_file.clone() + ".tmp", dns_file)
-		}).then(|_| { future::ok(()) })
+		}
+		
+		if let Ok(mut f) = File::create(dns_file.clone() + ".tmp").await {
+			let _ = f.write_all(dns_buff.as_bytes()).await;
+			let _ = f.sync_all().await;
+			let _ = tokio::fs::rename(dns_file.clone() + ".tmp", &dns_file).await;
+		}
 	}
 
 	pub fn get_next_scan_nodes(&self) -> Vec<SocketAddr> {
