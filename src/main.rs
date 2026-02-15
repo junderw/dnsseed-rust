@@ -463,6 +463,7 @@ fn parse_bgp_identifier(s: &str) -> Result<u32, String> {
 fn main() {
 	// Initialize tracing subscriber with env filter
 	// Use RUST_LOG env var to control log levels, e.g. RUST_LOG=debug or RUST_LOG=dnsseed_rust::bgp_client=trace
+	// Note: tracing-subscriber's fmt layer automatically captures `log` crate events
 	let filter = EnvFilter::try_from_default_env()
 		.unwrap_or_else(|_| EnvFilter::new("info"));
 	tracing_subscriber::fmt()
@@ -470,9 +471,6 @@ fn main() {
 		.with_target(true)
 		.with_thread_ids(true)
 		.init();
-
-	// Initialize tracing-log bridge to capture log crate events
-	tracing_log::LogTracer::init().expect("Failed to set log tracer");
 
 	info!("Starting dnsseed-rust");
 

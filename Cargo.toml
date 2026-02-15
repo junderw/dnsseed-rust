@@ -14,8 +14,7 @@ rand = "0.8"
 regex = "1"
 num_cpus = "1"
 tracing = "0.1"
-tracing-subscriber = { version = "0.3", features = ["env-filter"] }
-tracing-log = "0.2"
+tracing-subscriber = { version = "0.3", features = ["env-filter", "tracing-log"] }
 
 [profile.dev]
 panic = "abort"
