@@ -155,7 +155,8 @@ fn encode_base32(inp: &[u8]) -> String {
         let idx = ((acc << (5 - bits)) & ((1 << 5) - 1)) as usize;
         ret += &alphabet[idx..=idx];
     }
-    while !ret.len().is_multiple_of(8) {
+    #[allow(clippy::manual_is_multiple_of)]
+    while ret.len() % 8 != 0 {
         ret += "=";
     }
     ret

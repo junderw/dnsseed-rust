@@ -153,10 +153,10 @@ fn services_test() {
             last_good: 0,
             state: AddressState::Good,
             queued: false,
-            last_services: Node::services(0x1badcafedeadbeef)
+            last_services: Node::services(0x1bad_cafe_dead_beef)
         }
         .last_services(),
-        0x1badcafedeadbeef
+        0x1bad_cafe_dead_beef
     );
 }
 

@@ -1,4 +1,5 @@
 #![warn(clippy::pedantic)]
+#![warn(warnings)]
 mod bgp_client;
 mod bloom;
 mod datastore;
